@@ -216,9 +216,9 @@ fn malformed_headers_never_fall_back_to_headerless_parsing() {
 }
 
 #[test]
-fn ignored_inter_field_text_preserves_order_and_duplicate_fields() {
+fn ignored_inter_field_text_preserves_field_order() {
     let file = parse_file(
-        b"<NAME:3>Ray # arbitrary text\r\n<QSO_DATE:8>19960513 text <name:3>Ann tail <eOr>",
+        b"<NAME:3>Ray # arbitrary text\r\n<QSO_DATE:8>19960513 text <qth:3>Ann tail <eOr>",
         ParseEncoding::Ascii,
         LengthUnit::Bytes,
     );
@@ -228,7 +228,7 @@ fn ignored_inter_field_text_preserves_order_and_duplicate_fields() {
     assert_eq!(fields[0].text().unwrap(), "Ray");
     assert_eq!(fields[1].specifier.name, "QSO_DATE");
     assert_eq!(fields[1].text().unwrap(), "19960513");
-    assert_eq!(fields[2].specifier.name, "name");
+    assert_eq!(fields[2].specifier.name, "qth");
     assert_eq!(fields[2].text().unwrap(), "Ann");
 }
 
@@ -416,9 +416,9 @@ fn non_ascii_errors_locate_the_first_offending_byte_in_the_original_document() {
             (&b"ABC\xff"[..], 3, 22),
             (&b"A\xc3\xa9!"[..], 1, 20),
         ] {
-            let mut bytes = b"<NAME:3>Ray<NAME:4>".to_vec();
+            let mut bytes = b"<CALL:3>Ray<NAME:4>".to_vec();
             bytes.extend_from_slice(raw);
-            bytes.extend_from_slice(b"<NAME:3>Ann<EOR>");
+            bytes.extend_from_slice(b"<QTH:3>Ann<EOR>");
             let file = parse_file(&bytes, ParseEncoding::Ascii, unit);
             assert_eq!(file.records.len(), 1);
             let fields = &file.records[0].fields;
@@ -447,7 +447,7 @@ fn non_ascii_errors_locate_the_first_offending_byte_in_the_original_document() {
 #[test]
 fn decoding_errors_remain_in_complete_records() {
     let file = parse_file(
-        b"<NAME:1>\xff<NAME:3>Ray<EOR>",
+        b"<NAME:1>\xff<QTH:3>Ray<EOR>",
         ParseEncoding::Utf8,
         LengthUnit::Bytes,
     );
@@ -1011,4 +1011,165 @@ fn upstream_unterminated_fixture_has_two_complete_records_before_failure() {
     );
     assert_eq!(*input.input.as_ref(), b"<mycall:4>W1AW\n");
     assert!(record(&mut input).is_err());
+}
+
+#[test]
+fn public_accessors_preserve_syntactic_spans_across_records() {
+    let bytes = b"skip<NAME:1>A<EOR>\r\ntext<NAME:0><EOR>\n";
+    let mut input = ascii_stream(bytes);
+    let first = record(&mut input).unwrap();
+    let second = record(&mut input).unwrap();
+    assert_eq!(first.span(), 4..18);
+    assert_eq!(second.span(), 24..37);
+    assert_eq!(first.fields().len(), 1);
+    let a = first.field("name").unwrap();
+    assert_eq!(a.name(), "NAME");
+    assert_eq!(a.declared_length(), 1);
+    assert_eq!(a.data_type(), None);
+    assert_eq!(a.descriptor_span(), 4..12);
+    assert_eq!(a.value_span(), 12..13);
+    assert_eq!(&bytes[a.value_span()], a.raw_data());
+    assert_eq!(second.field("NAME").unwrap().value_span(), 32..32);
+}
+
+#[test]
+fn header_spans_use_original_bytes_and_exclude_following_separators() {
+    for (bytes, encoding, preamble_end, section_end) in [
+        (
+            &b"Jos\xc3\xa9\r\n<PROGRAMID:0><EOH>\r\n"[..],
+            ParseEncoding::Utf8,
+            7,
+            25,
+        ),
+        (
+            &b"Jos\xe9\r\n<PROGRAMID:0><EOH>\r\n"[..],
+            ParseEncoding::Latin1,
+            6,
+            24,
+        ),
+        (&b"A\xff\n<EOH>\n"[..], ParseEncoding::Ascii, 3, 8),
+    ] {
+        let parsed = header(&mut stream(bytes, encoding, LengthUnit::Bytes)).unwrap();
+        assert_eq!(parsed.text_span(), 0..preamble_end);
+        assert_eq!(parsed.span(), 0..section_end);
+        assert_eq!(&bytes[parsed.text_span()], parsed.raw_text());
+        if encoding == ParseEncoding::Ascii {
+            assert_eq!(parsed.text(), Err(&DecodeError::NonAscii { offset: 1 }));
+        } else {
+            assert_eq!(parsed.field("programid").unwrap().text().unwrap(), "");
+        }
+    }
+}
+
+#[test]
+fn duplicate_names_are_rejected_with_both_descriptor_locations() {
+    for (bytes, first, second) in [
+        (&b"<NAME:3>Ray<name:3>Ray<EOR>"[..], 0..8, 11..19),
+        (&b"<NAME:3>Ray<NAME:3>Ann<EOR>"[..], 0..8, 11..19),
+        (&b"<NAME:3:S>Ray<name:3:S>Ray<EOR>"[..], 0..10, 13..23),
+        (&b"<NAME:3:S>Ray<name:3:N>123<EOR>"[..], 0..10, 13..23),
+    ] {
+        for is_header in [false, true] {
+            let mut document = Vec::new();
+            if is_header {
+                document.extend_from_slice(b"P");
+            }
+            document.extend_from_slice(bytes.strip_suffix(b"<EOR>").unwrap());
+            document.extend_from_slice(if is_header { b"<EOH>" } else { b"<EOR>" });
+            let shift = usize::from(is_header);
+            let error = adi_file.parse(ascii_stream(&document)).unwrap_err();
+            assert_eq!(error.offset(), second.start + shift);
+            let cause = error
+                .inner()
+                .cause()
+                .and_then(|c| c.downcast_ref::<AdiError>())
+                .unwrap();
+            let AdiError::DuplicateField {
+                first_span,
+                second_span,
+                field_name,
+            } = cause
+            else {
+                panic!("expected duplicate error, got {cause:?}");
+            };
+            assert!(field_name.eq_ignore_ascii_case("NAME"));
+            assert_eq!(*first_span, (first.start + shift)..(first.end + shift));
+            assert_eq!(*second_span, (second.start + shift)..(second.end + shift));
+        }
+    }
+}
+
+#[test]
+fn duplicate_tracking_is_independent_for_each_section() {
+    let file = parse_file(
+        b"P<NAME:1>H<EOH><name:1>A<EOR><NAME:1>B<EOR>",
+        ParseEncoding::Ascii,
+        LengthUnit::Bytes,
+    );
+    assert_eq!(
+        file.header.unwrap().field("name").unwrap().text().unwrap(),
+        "H"
+    );
+    assert_eq!(file.records.len(), 2);
+    assert_eq!(file.records[0].field("NAME").unwrap().text().unwrap(), "A");
+    assert_eq!(file.records[1].field("name").unwrap().text().unwrap(), "B");
+}
+
+#[test]
+fn structural_errors_have_typed_categories_and_original_locations() {
+    use super::error::{StructuralError, StructuralErrorKind, SyntaxErrorKind};
+    for (bytes, reason, span) in [
+        (
+            &b"<NAME:x>Ray<EOR>"[..],
+            SyntaxErrorKind::InvalidLength,
+            6..7,
+        ),
+        (
+            &b"<NAME:3:Z>Ray<EOR>"[..],
+            SyntaxErrorKind::UnknownTypeIndicator,
+            8..9,
+        ),
+        (&b"<NAME:3>Ray"[..], SyntaxErrorKind::MissingEor, 11..11),
+        (&b"P<NAME:1>A"[..], SyntaxErrorKind::MissingEoh, 10..10),
+    ] {
+        let mut input = ascii_stream(bytes);
+        let error = adi_file(&mut input).unwrap_err();
+        let error = StructuralError::from_context(error, input.current_token_start(), bytes.len());
+        assert_eq!(error.span(), span);
+        assert!(
+            matches!(error.kind(), StructuralErrorKind::Syntax { reason: actual } if *actual == reason)
+        );
+    }
+    let bytes = format!("<NAME:{}0>", usize::MAX);
+    let mut input = ascii_stream(bytes.as_bytes());
+    let context = field(&mut input).unwrap_err();
+    let error = StructuralError::from_context(context, input.current_token_start(), bytes.len());
+    assert!(matches!(
+        error.kind(),
+        StructuralErrorKind::Syntax {
+            reason: SyntaxErrorKind::LengthOverflow
+        }
+    ));
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn scalar_utf8_errors_retain_the_standard_cause_and_sequence_span() {
+    use super::error::{StructuralError, StructuralErrorKind};
+    for (bytes, span, error_len) in [
+        (&b"<NAME:1>\xe2A"[..], 8..9, Some(1)),
+        (&b"<NAME:1>\xe2\x82"[..], 8..10, None),
+        (&b"<NAME:1>\xff"[..], 8..9, Some(1)),
+    ] {
+        let mut input = stream(bytes, ParseEncoding::Utf8, LengthUnit::UnicodeScalars);
+        let context = field(&mut input).unwrap_err();
+        let error =
+            StructuralError::from_context(context, input.current_token_start(), bytes.len());
+        assert_eq!(error.span(), span);
+        let StructuralErrorKind::InvalidUtf8 { cause } = error.kind() else {
+            panic!("{error:?}");
+        };
+        assert_eq!(cause.error_len(), error_len);
+        assert_eq!(cause.valid_up_to(), 0);
+    }
 }

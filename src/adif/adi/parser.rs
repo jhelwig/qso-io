@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use winnow::{
     LocatingSlice, Parser as _, Result, Stateful,
@@ -11,12 +11,14 @@ use winnow::{
 
 use crate::adif::{
     DataSpecifier, DataType, DecodeError, Field, LengthUnit, ParseEncoding, ParseOpts,
-    adi::{AdiFile, Header, Record, parser::error::AdiError},
+    adi::{Header, Record, Section, parser::error::AdiError},
 };
 
-mod error;
+pub(super) mod error;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+use super::AdiFile;
 
 #[derive(Debug)]
 struct State {
@@ -24,6 +26,101 @@ struct State {
 }
 
 type Stream<'is> = Stateful<LocatingSlice<&'is [u8]>, State>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Phase {
+    Start,
+    Records,
+    Finished,
+}
+
+/// Reads complete ADI sections from a borrowed byte slice.
+///
+/// Earlier sections remain usable if a later section fails. A structural error
+/// is yielded once, followed by permanent exhaustion. Decoding errors remain
+/// stored on their reliably framed fields or header preamble.
+///
+/// ```
+/// use qso_io::adif::{adi::{Parser, Section}, ParseOpts, ParseEncoding, LengthUnit};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let options = ParseOpts { encoding: ParseEncoding::Latin1, field_length: LengthUnit::Bytes };
+/// for section in Parser::new(b"<CALL:4>W1AW<EOR>", options) {
+///     if let Section::Record(record) = section? {
+///         assert_eq!(record.field("call").unwrap().text().unwrap(), "W1AW");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct Parser<'a> {
+    input: Stream<'a>,
+    input_len: usize,
+    phase: Phase,
+}
+
+impl<'a> Parser<'a> {
+    /// Constructs a parser without reading input or detecting its encoding.
+    pub fn new(input: &'a [u8], options: ParseOpts) -> Self {
+        Self {
+            input: Stateful {
+                input: LocatingSlice::new(input),
+                state: State {
+                    parser_options: options,
+                },
+            },
+            input_len: input.len(),
+            phase: Phase::Start,
+        }
+    }
+
+    fn next_section(&mut self) -> Result<Option<Section<'a>>> {
+        if self.phase == Phase::Start {
+            self.phase = Phase::Records;
+            if self.input.peek_token().is_some_and(|byte| byte != b'<') {
+                return header
+                    .parse_next(&mut self.input)
+                    .map(Section::Header)
+                    .map(Some);
+            }
+        }
+        take_till(0.., b'<').void().parse_next(&mut self.input)?;
+        if self.input.peek_token().is_none() {
+            return Ok(None);
+        }
+        record
+            .parse_next(&mut self.input)
+            .map(Section::Record)
+            .map(Some)
+    }
+}
+
+impl<'a> Iterator for Parser<'a> {
+    type Item = std::result::Result<Section<'a>, error::StructuralError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.phase == Phase::Finished {
+            return None;
+        }
+        match self.next_section() {
+            Ok(Some(section)) => Some(Ok(section)),
+            Ok(None) => {
+                self.phase = Phase::Finished;
+                None
+            }
+            Err(context) => {
+                self.phase = Phase::Finished;
+                Some(Err(error::StructuralError::from_context(
+                    context,
+                    self.input.current_token_start(),
+                    self.input_len,
+                )))
+            }
+        }
+    }
+}
+
+impl std::iter::FusedIterator for Parser<'_> {}
 
 fn decode_text<'a>(bytes: &'a [u8], encoding: ParseEncoding) -> Result<Cow<'a, str>, DecodeError> {
     match encoding {
@@ -39,8 +136,9 @@ fn decode_text<'a>(bytes: &'a [u8], encoding: ParseEncoding) -> Result<Cow<'a, s
 }
 
 fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
+    let mut seen = HashMap::new();
     let parse_opts = input.state.parser_options;
-    let ((text_bytes, text_span), fields) = seq!(
+    let ((text_bytes, text_span), (fields, end_span)) = seq!(
         take_till(0.., b'<').with_span().context(StrContext::Label("header text")),
         _: multispace0,
         repeat_till(0.., terminated(preceded(
@@ -49,9 +147,8 @@ fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
                 .context(StrContext::Expected(
                     StrContextValue::StringLiteral("<EOH>"),
                 )),
-            field,
+            |input: &mut Stream<'a>| unique_field(input, &mut seen),
         ), take_till(0.., b'<')), eoh)
-            .map(|(f, _)| f)
             .context(StrContext::Label("header field")),
         _: take_till(0.., b'<'),
     )
@@ -59,6 +156,7 @@ fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
     let text = decode_text(text_bytes, parse_opts.encoding);
 
     Ok(Header {
+        span: text_span.start..end_span.end,
         text_bytes,
         text_span,
         text,
@@ -66,25 +164,25 @@ fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
     })
 }
 
-fn eor<'a>(input: &mut Stream<'a>) -> Result<()> {
-    (Caseless("<EOR>"), opt(line_ending))
-        .void()
+fn eor<'a>(input: &mut Stream<'a>) -> Result<Range<usize>> {
+    terminated(Caseless("<EOR>").span(), opt(line_ending))
         .context(StrContext::Label("end of record"))
         .parse_next(input)
 }
 
-fn eoh<'a>(input: &mut Stream<'a>) -> Result<()> {
+fn eoh<'a>(input: &mut Stream<'a>) -> Result<Range<usize>> {
     Caseless("<EOH>")
-        .void()
+        .span()
         .context(StrContext::Label("end of header"))
         .parse_next(input)
 }
 
 fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
-    let specifier = data_specifier.parse_next(input)?;
+    let (specifier, descriptor_span) = data_specifier.with_span().parse_next(input)?;
     if specifier.length == 0 {
         return Ok(Field {
             specifier,
+            descriptor_span,
             raw_data: &[],
             value_span: Range {
                 start: input.current_token_start(),
@@ -103,7 +201,7 @@ fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
 
     let byte_count = match (parse_opts.encoding, parse_opts.field_length) {
         (ParseEncoding::Utf8, LengthUnit::UnicodeScalars) => {
-            let mut remaining: &[u8] = *input.input.as_ref();
+            let mut remaining: &[u8] = input.input.as_ref();
             let mut byte_count = 0;
 
             for idx in 0..specifier.length {
@@ -117,7 +215,17 @@ fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
 
                         error
                     } else {
-                        let mut error = ContextError::new();
+                        let start = input.current_token_start();
+                        let cause = std::str::from_utf8(&remaining[..remaining.len().min(4)])
+                            .expect_err("decode_utf8 rejected this prefix");
+                        let mut error = ContextError::from_external_error(
+                            input,
+                            AdiError::InvalidUtf8 {
+                                span: start
+                                    ..start + cause.error_len().unwrap_or(remaining.len().min(4)),
+                                cause,
+                            },
+                        );
                         error.push(StrContext::Label("field data"));
                         error.push(StrContext::Expected(StrContextValue::Description(
                             "a complete, valid UTF-8 scalar",
@@ -158,9 +266,46 @@ fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
 
     Ok(Field {
         specifier,
+        descriptor_span,
         raw_data,
         value_span,
         text,
+    })
+}
+
+fn declared_length(input: &mut Stream<'_>) -> Result<usize> {
+    let checkpoint = input.checkpoint();
+    let start = input.current_token_start();
+    let digits: &[u8] = match digit1::<_, ContextError>.parse_next(input) {
+        Ok(digits) => digits,
+        Err(_) => {
+            let span = start..start + usize::from(input.eof_offset() != 0);
+            let mut error = ContextError::from_external_error(
+                input,
+                error::AdiError::Syntax {
+                    reason: error::SyntaxErrorKind::InvalidLength,
+                    span,
+                    cause: None,
+                },
+            );
+            error.push(StrContext::Label("length"));
+            return Err(error);
+        }
+    };
+    // digit1 on this byte stream returns ASCII digits only.
+    let number = std::str::from_utf8(digits).expect("ASCII digits");
+    number.parse::<usize>().map_err(|cause| {
+        input.reset(&checkpoint);
+        let mut error = ContextError::from_external_error(
+            input,
+            error::AdiError::Syntax {
+                reason: error::SyntaxErrorKind::LengthOverflow,
+                span: start..start + digits.len(),
+                cause: Some(cause),
+            },
+        );
+        error.push(StrContext::Label("length"));
+        error
     })
 }
 
@@ -169,9 +314,7 @@ fn data_specifier<'a>(input: &mut Stream<'a>) -> Result<DataSpecifier<'a>> {
         _: '<',
         take_until(0.., ":").context(StrContext::Label("name")),
         _: ':',
-        digit1
-            .parse_to::<usize>()
-            .context(StrContext::Label("length")),
+        declared_length,
         optional_data_type,
         _: '>',
     )
@@ -205,30 +348,54 @@ fn optional_data_type<'a>(input: &mut Stream<'a>) -> Result<Option<DataType>> {
     }
 }
 
-fn record<'a>(input: &mut Stream<'a>) -> Result<Record<'a>> {
-    (
-        take_until(0.., '<').void(),
-        repeat_till(
-            1..,
-            terminated(
-                preceded(
-                    not(eof)
-                        .context(StrContext::Label("record"))
-                        .context(StrContext::Expected(StrContextValue::StringLiteral(
-                            "<EOR>",
-                        ))),
-                    field,
-                ),
-                take_till(0.., b'<'),
-            ),
-            eor,
-        ),
-    )
-        .map(|(_, (fields, _))| Record { fields })
-        .context(StrContext::Label("record"))
-        .parse_next(input)
+fn unique_field<'a>(
+    input: &mut Stream<'a>,
+    seen: &mut HashMap<String, Range<usize>>,
+) -> Result<Field<'a>> {
+    let checkpoint = input.checkpoint();
+    let parsed = field.parse_next(input)?;
+    let key = parsed.name().to_ascii_uppercase();
+    if let Some(first_span) = seen.get(&key) {
+        let cause = AdiError::DuplicateField {
+            field_name: parsed.name().to_owned(),
+            first_span: first_span.clone(),
+            second_span: parsed.descriptor_span(),
+        };
+        input.reset(&checkpoint);
+        return Err(ContextError::from_external_error(input, cause));
+    }
+    seen.insert(key, parsed.descriptor_span());
+    Ok(parsed)
 }
 
+fn record<'a>(input: &mut Stream<'a>) -> Result<Record<'a>> {
+    let mut seen = HashMap::new();
+    take_until(0.., '<').void().parse_next(input)?;
+    let start = input.current_token_start();
+    repeat_till(
+        1..,
+        terminated(
+            preceded(
+                not(eof)
+                    .context(StrContext::Label("record"))
+                    .context(StrContext::Expected(StrContextValue::StringLiteral(
+                        "<EOR>",
+                    ))),
+                |input: &mut Stream<'a>| unique_field(input, &mut seen),
+            ),
+            take_till(0.., b'<'),
+        ),
+        eor,
+    )
+    .map(|(fields, end_span)| Record {
+        fields,
+        span: start..end_span.end,
+    })
+    .context(StrContext::Label("record"))
+    .parse_next(input)
+}
+
+#[cfg(test)]
 fn adi_file<'a>(input: &mut Stream<'a>) -> Result<AdiFile<'a>> {
     let header = match input.peek_token() {
         None | Some(b'<') => None,
@@ -298,6 +465,7 @@ mod test {
                     data_type: None,
                 },
                 raw_data: "Ray".as_bytes(),
+                descriptor_span: 0..8,
                 value_span: 8..11,
                 text: Ok(Cow::Owned("Ray".to_owned())),
             },
@@ -328,6 +496,7 @@ mod test {
         assert_eq!(
             Header {
                 text_bytes: "Generated on 2011-11-22 at 02:15:23Z for WN4AZY\n\n".as_bytes(),
+                span: 0..180,
                 text_span: 0..49,
                 text: Ok("Generated on 2011-11-22 at 02:15:23Z for WN4AZY\n\n".into()),
                 fields: vec![
@@ -338,6 +507,7 @@ mod test {
                             data_type: None
                         },
                         raw_data: "3.0.5".as_bytes(),
+                        descriptor_span: 49..61,
                         value_span: 61..66,
                         text: Ok(Cow::Owned("3.0.5".to_owned())),
                     },
@@ -348,6 +518,7 @@ mod test {
                             data_type: None
                         },
                         raw_data: "MonoLog".as_bytes(),
+                        descriptor_span: 67..80,
                         value_span: 80..87,
                         text: Ok(Cow::Owned("MonoLog".to_owned())),
                     },
@@ -358,6 +529,7 @@ mod test {
                             data_type: Some(DataType::Number)
                         },
                         raw_data: "QRP_ARCI".as_bytes(),
+                        descriptor_span: 88..102,
                         value_span: 102..110,
                         text: Ok(Cow::Owned("QRP_ARCI".to_owned())),
                     },
@@ -368,6 +540,7 @@ mod test {
                             data_type: Some(DataType::Enumeration)
                         },
                         raw_data: "SweaterSize,{S,M,L}".as_bytes(),
+                        descriptor_span: 111..126,
                         value_span: 126..145,
                         text: Ok(Cow::Owned("SweaterSize,{S,M,L}".to_owned())),
                     },
@@ -378,6 +551,7 @@ mod test {
                             data_type: None
                         },
                         raw_data: "ShoeSize,{5:20}".as_bytes(),
+                        descriptor_span: 146..159,
                         value_span: 159..174,
                         text: Ok(Cow::Owned("ShoeSize,{5:20}".to_owned())),
                     }

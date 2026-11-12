@@ -8,8 +8,8 @@ mod parser;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct ParseOpts {
-    encoding: ParseEncoding,
-    field_length: LengthUnit,
+    pub encoding: ParseEncoding,
+    pub field_length: LengthUnit,
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -31,11 +31,31 @@ pub enum LengthUnit {
 pub struct Field<'a> {
     specifier: DataSpecifier<'a>,
     raw_data: &'a [u8],
+    descriptor_span: Range<usize>,
     value_span: Range<usize>,
     text: Result<Cow<'a, str>, DecodeError>,
 }
 
 impl<'a> Field<'a> {
+    pub fn name(&self) -> &str {
+        &self.specifier.name
+    }
+    pub fn declared_length(&self) -> usize {
+        self.specifier.length
+    }
+    pub fn data_type(&self) -> Option<DataType> {
+        self.specifier.data_type
+    }
+    pub fn raw_data(&self) -> &'a [u8] {
+        self.raw_data
+    }
+    pub fn descriptor_span(&self) -> Range<usize> {
+        self.descriptor_span.clone()
+    }
+    pub fn value_span(&self) -> Range<usize> {
+        self.value_span.clone()
+    }
+
     pub fn text(&self) -> Result<&str, &DecodeError> {
         self.text.as_deref()
     }
