@@ -9,12 +9,19 @@ use crate::adif::{DataTypeError, LengthUnit};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SyntaxErrorKind {
+    /// A field descriptor is incomplete or does not match the ADI syntax.
     MalformedDescriptor,
+    /// The required unsigned ASCII decimal length is missing or malformed.
     InvalidLength,
+    /// The decimal length cannot be represented by the parser's `usize`.
     LengthOverflow,
+    /// A supplied indicator is not one of the recognized ADIF type indicators.
     UnknownTypeIndicator,
+    /// Input ended between header fields without the required EOH tag.
     MissingEoh,
+    /// Input ended after complete record fields without the required EOR tag.
     MissingEor,
+    /// The supplied field-name bytes are not valid UTF-8.
     InvalidNameEncoding,
 }
 
@@ -22,21 +29,37 @@ pub enum SyntaxErrorKind {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StructuralErrorKind {
+    /// Malformed syntax or a required section terminator missing at EOF.
     Syntax {
+        /// The specific syntactic requirement that was not satisfied.
         reason: SyntaxErrorKind,
     },
+    /// Input ended before a field supplied its declared number of units.
     TruncatedValue {
+        /// Field name as supplied in the affected descriptor.
         field_name: String,
+        /// Length declared by the descriptor, measured in `unit`.
         declared: usize,
+        /// Complete units present before EOF, measured in `unit`.
         available: usize,
+        /// Selected length interpretation; both counts use this unit.
         unit: LengthUnit,
     },
+    /// A header or record repeats a field name, ignoring ASCII case.
     DuplicateField {
+        /// Field name as supplied in the affected descriptor.
         field_name: String,
+        /// First descriptor's original byte range, with exclusive end.
         first_span: Range<usize>,
+        /// Repeated descriptor's original byte range and primary error location.
         second_span: Range<usize>,
     },
+    /// Invalid or incomplete UTF-8 prevented scalar-counted value framing.
+    ///
+    /// UTF-8 failures in reliably byte-framed text are stored as
+    /// [`crate::adif::DecodeError`] instead.
     InvalidUtf8 {
+        /// Standard decoding cause, relative to the error sequence's start.
         cause: Utf8Error,
     },
 }
@@ -44,7 +67,7 @@ pub enum StructuralErrorKind {
 /// A structural error located in the original input byte slice.
 ///
 /// Spans have exclusive ends. EOF failures have an empty span at input length.
-/// Display reports metadata, without rendering the source input.
+/// Display reports the byte range and error details.
 #[derive(Debug)]
 pub struct StructuralError {
     span: Range<usize>,
@@ -53,9 +76,14 @@ pub struct StructuralError {
 }
 
 impl StructuralError {
+    /// Returns the primary error range in original input bytes.
+    ///
+    /// The end is exclusive. Truncation and missing-terminator errors point to
+    /// an empty range at EOF; duplicate errors identify the second descriptor.
     pub fn span(&self) -> Range<usize> {
         self.span.clone()
     }
+    /// Borrows structured details independently of the formatted message.
     pub fn kind(&self) -> &StructuralErrorKind {
         &self.kind
     }

@@ -1,32 +1,62 @@
+//! Amateur Data Interchange Format (ADIF) types and ADI parsing options.
+//!
+//! The [`adi`](crate::adif::adi) module reads length-delimited ADI sections.
+//! Reference enums describe ADIF value categories and enumeration members.
+
 use std::{borrow::Cow, ops::Range, str::Utf8Error};
 
 use chrono::NaiveDate;
 use thiserror::Error;
 
+/// Borrowed ADI sections, their parser, and structural diagnostics.
 pub mod adi;
 mod parser;
 
+/// Explicit text encoding and declared-length interpretation for one parser.
+///
+/// Defaults to ASCII and byte lengths. The selected settings apply to the
+/// entire input.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct ParseOpts {
+    /// Encoding used to decode field values and header preamble text.
     pub encoding: ParseEncoding,
+    /// Unit used to interpret each descriptor's declared value length.
     pub field_length: LengthUnit,
 }
 
+/// How raw field values and preamble bytes are decoded into Unicode text.
+///
+/// Latin-1 and UTF-8 provide explicit compatibility modes for non-ASCII input.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub enum ParseEncoding {
+    /// Accept bytes 0x00–0x7F; report the first byte outside that range.
     #[default]
     Ascii,
+    /// Map every byte directly to U+0000–U+00FF, including C1 controls.
+    ///
+    /// This is ISO-8859-1/Latin-1 mapping, not Windows-1252.
     Latin1,
+    /// Validate UTF-8 without replacing invalid or incomplete sequences.
     Utf8,
 }
 
+/// Unit of the value length declared in an ADI field descriptor.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub enum LengthUnit {
+    /// Count original input bytes before attempting text decoding.
     #[default]
     Bytes,
+    /// Count Unicode scalar values, rather than grapheme clusters or UTF-16 units.
+    ///
+    /// ASCII and Latin-1 use one byte per scalar. UTF-8 boundaries require valid
+    /// scalar traversal; malformed input can therefore cause a structural error.
     UnicodeScalars,
 }
 
+/// A complete length-framed field with immutable bytes and cached text decoding.
+///
+/// Name casing and raw value bytes are preserved. Decoding failures are stored
+/// alongside the original bytes in the complete section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field<'a> {
     specifier: DataSpecifier<'a>,
@@ -37,36 +67,62 @@ pub struct Field<'a> {
 }
 
 impl<'a> Field<'a> {
+    /// Returns the field name with its original casing.
     pub fn name(&self) -> &str {
         &self.specifier.name
     }
+    /// Returns the descriptor's length in the unit selected by [`ParseOpts`].
     pub fn declared_length(&self) -> usize {
         self.specifier.length
     }
+    /// Returns the data type identified by the descriptor's optional indicator.
     pub fn data_type(&self) -> Option<DataType> {
         self.specifier.data_type
     }
+    /// Borrows the original value bytes, including any bytes that fail decoding.
     pub fn raw_data(&self) -> &'a [u8] {
         self.raw_data
     }
+    /// Returns the original byte range from the descriptor's `<` through `>`.
+    ///
+    /// The end is exclusive; value bytes are not included.
     pub fn descriptor_span(&self) -> Range<usize> {
         self.descriptor_span.clone()
     }
+    /// Returns the original value's byte range with an exclusive end.
+    ///
+    /// An empty value has an empty range at its actual input position, and spans
+    /// always count bytes even when the declared length counts scalars.
     pub fn value_span(&self) -> Range<usize> {
         self.value_span.clone()
     }
 
+    /// Borrows the cached decoded text or its decoding error without re-decoding.
+    ///
+    /// Error offsets are relative to the value; add [`Self::value_span`]'s start
+    /// to locate an offending byte in the original input.
     pub fn text(&self) -> Result<&str, &DecodeError> {
         self.text.as_deref()
     }
 }
 
+/// Text-decoding failure for bytes whose field or preamble boundary is known.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("Non-ASCII byte at offset {offset}")]
-    NonAscii { offset: usize },
+    /// A byte cannot be represented by the selected ASCII encoding.
+    NonAscii {
+        /// Zero-based byte offset of the first non-ASCII byte within the value
+        /// or preamble, not within the whole document.
+        offset: usize,
+    },
     #[error("UTF-8 decode: {0}")]
-    Utf8(#[from] Utf8Error),
+    /// Invalid or incomplete UTF-8 in a reliably framed value or preamble.
+    Utf8(
+        /// Standard UTF-8 error; its offsets are relative to those raw bytes.
+        #[from]
+        Utf8Error,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +132,9 @@ struct DataSpecifier<'a> {
     data_type: Option<DataType>,
 }
 
-/// https://adif.org.uk/318/ADIF_318.htm#Data_Types_Enumerations_and_Fields
+/// ADIF value categories and their optional descriptor indicators.
+///
+/// See [ADIF 3.1.8 data types](https://www.adif.org.uk/318/ADIF_318.htm#Data_Types).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DataType {
     /// a comma-delimited list of members of the Award enumeration
@@ -181,7 +239,7 @@ pub enum DataType {
     ///   and trailing zeroes]
     Location,
     /// a sequence of case-insensitive Characters representing a Parks on the
-    /// Air park reference in the form xxxx-nnnnn[@yyyyyy] comprising 6 to 17
+    /// Air park reference in the form `xxxx-nnnnn[@yyyyyy]` comprising 6 to 17
     /// characters where:
 
     /// * xxxx is the POTA national program and is 1 to 4 characters in length,
@@ -202,22 +260,42 @@ pub enum DataType {
     ///
     /// `MA,Franklin:MA,Hampshire`
     SecondarySubdivisionList,
-    Secondary,
-    Administrative,
-    SubdivisionListAlt,
+    /// An unordered, semicolon-delimited list of one or more alternate secondary
+    /// administrative subdivisions, each written as `enumeration-name:enumeration-code`.
+    ///
+    /// A code covering multiple localities separates them with `/`. Each
+    /// enumeration name may occur only once and must apply to the DXCC entity.
+    /// For example: `NZ_Regions:Hawkes Bay/Wairoa`.
+    ///
+    /// Used by `CNTY_ALT` and `MY_CNTY_ALT`; this type has no descriptor indicator.
+    /// See [ADIF 3.1.8 data types](https://www.adif.org.uk/318/ADIF_318.htm#Data_Types).
+    SecondaryAdministrativeSubdivisionListAlt,
+    /// An International SOTA reference formed from an ITU prefix, an optional
+    /// SOTA subdivision, `/`, and a SOTA reference number, in that order.
+    ///
+    /// Examples: `W2/WE-003`, `G/LD-003`.
     SOTARef,
+    /// A case-insensitive International WWFF reference using `xxFF-nnnn`.
+    ///
+    /// The national program identifier `xx` occupies 1–4 characters, followed
+    /// by the literal `FF-` and a four-digit program-local number padded with
+    /// leading zeros. The complete reference occupies 8–11 characters.
+    ///
+    /// Examples: `KFF-4655`, `3DAFF-0002`.
     WWFFRef,
 }
 
 impl DataType {
-    /// Deprecated fields and enumeration values shall be accepted when
-    /// importing an ADIF file, but shall not be emitted when exporting
-    /// an ADIF file.  Deprecated items in this specification are characterized
-    /// as "Import-only".
+    /// Reports whether this data type is defined only for importing legacy data.
+    ///
+    /// Returns `true` for [`Self::AwardList`] and `false` for other types.
     pub fn import_only(self) -> bool {
         self == DataType::AwardList
     }
 
+    /// Returns the uppercase ADIF indicator, or `None` for types without one.
+    ///
+    /// The international string indicators `I` and `G` designate ADX types.
     pub fn type_indicator(self) -> Option<&'static str> {
         match self {
             DataType::Boolean => Some("B"),
@@ -245,21 +323,29 @@ impl DataType {
             | DataType::POTARef
             | DataType::POTARefList
             | DataType::SecondarySubdivisionList
-            | DataType::Secondary
-            | DataType::Administrative
-            | DataType::SubdivisionListAlt
+            | DataType::SecondaryAdministrativeSubdivisionListAlt
             | DataType::SOTARef
             | DataType::WWFFRef => None,
         }
     }
 }
 
+/// Failure to recognize or decode a supplied ADIF type indicator.
 #[derive(Debug, Error)]
 pub enum DataTypeError {
     #[error("Unknown type specifier: {0}")]
-    UnknownTypeSpecifier(String),
+    /// The supplied text is not a recognized single type indicator.
+    UnknownTypeSpecifier(
+        /// Original unrecognized indicator text, including its supplied casing.
+        String,
+    ),
     #[error("UTF-8 error: {0}")]
-    Utf8(#[from] std::string::FromUtf8Error),
+    /// The bytes used for an indicator could not be decoded as UTF-8.
+    Utf8(
+        /// Standard error retaining the invalid indicator bytes.
+        #[from]
+        std::string::FromUtf8Error,
+    ),
 }
 
 impl TryFrom<&str> for DataType {
@@ -282,6 +368,7 @@ impl TryFrom<&str> for DataType {
     }
 }
 
+/// ADIF antenna-path codes describing how the signal propagated.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum AntPath {
     /// Grayline
@@ -294,18 +381,27 @@ pub enum AntPath {
     L,
 }
 
+/// A partial reference list of ARRL section identifiers and their metadata.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ArrlSection {
+    /// Alabama.
     AL,
+    /// Alaska.
     AK,
+    /// Alberta.
     AB,
+    /// Arkansas.
     AR,
+    /// Arizona.
     AZ,
+    /// British Columbia.
     BC,
+    /// Colorado.
     CO,
 }
 
 impl ArrlSection {
+    /// Returns the human-readable section name.
     pub fn name(self) -> &'static str {
         match self {
             ArrlSection::AL => "Alabama",
@@ -318,6 +414,7 @@ impl ArrlSection {
         }
     }
 
+    /// Returns the associated ADIF DXCC entity code.
     pub fn dxcc_entity_code(self) -> u16 {
         match self {
             ArrlSection::AL | ArrlSection::AR | ArrlSection::AZ | ArrlSection::CO => 291,
@@ -327,6 +424,8 @@ impl ArrlSection {
         }
     }
 
+    /// Returns the section's From Date from the ADIF enumeration, or `None`
+    /// when the specification leaves it unspecified.
     pub fn from_date(self) -> Option<NaiveDate> {
         match self {
             ArrlSection::AL
@@ -339,6 +438,8 @@ impl ArrlSection {
         }
     }
 
+    /// Returns the section's Deleted Date from the ADIF enumeration, or `None`
+    /// when the specification leaves it unspecified.
     pub fn deleted_date(self) -> Option<NaiveDate> {
         match self {
             ArrlSection::AL
@@ -352,35 +453,65 @@ impl ArrlSection {
     }
 }
 
+/// Award identifiers from ADIF's import-only Award enumeration.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Award {
+    /// ADIF `AJA` identifier (import-only).
     Aja,
+    /// ADIF `CQDX` identifier (import-only).
     Cqdx,
+    /// ADIF `CQDXFIELD` identifier (import-only).
     Cqdxfield,
+    /// ADIF `CQWAZ_MIXED` identifier (import-only).
     CqwazMixed,
+    /// ADIF `CQWAZ_CW` identifier (import-only).
     CqwazCw,
+    /// ADIF `CQWAZ_PHONE` identifier (import-only).
     CqwazPhone,
+    /// ADIF `CQWAZ_RTTY` identifier (import-only).
     CqwazRtty,
+    /// ADIF `CQWAZ_160m` identifier (import-only).
     Cqwaz160m,
+    /// ADIF `CQWPX` identifier (import-only).
     Cqwpx,
+    /// ADIF `DARC_DOK` identifier (import-only).
     DarcDok,
+    /// ADIF `DXCC` identifier (import-only).
     Dxcc,
+    /// ADIF `DXCC_MIXED` identifier (import-only).
     DxccMixed,
+    /// ADIF `DXCC_CW` identifier (import-only).
     DxccCw,
+    /// ADIF `DXCC_PHONE` identifier (import-only).
     DxccPhone,
+    /// ADIF `DXCC_RTTY` identifier (import-only).
     DxccRtty,
+    /// ADIF `IOTA` identifier (import-only).
     Iota,
+    /// ADIF `JCC` identifier (import-only).
     Jcc,
+    /// ADIF `JCG` identifier (import-only).
     Jcg,
+    /// ADIF `MARATHON` identifier (import-only).
     Marathon,
+    /// ADIF `RDA` identifier (import-only).
     Rda,
+    /// ADIF `WAB` identifier (import-only).
     Wab,
+    /// ADIF `WAC` identifier (import-only).
     Wac,
+    /// ADIF `WAE` identifier (import-only).
     Wae,
+    /// ADIF `WAIP` identifier (import-only).
     Waip,
+    /// ADIF `WAJA` identifier (import-only).
     Waja,
+    /// ADIF `WAS` identifier (import-only).
     Was,
+    /// ADIF `WAZ` identifier (import-only).
     Waz,
+    /// ADIF `USACA` identifier (import-only).
     Usaca,
+    /// ADIF `VUCC` identifier (import-only).
     Vucc,
 }

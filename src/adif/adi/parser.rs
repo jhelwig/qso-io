@@ -40,6 +40,11 @@ enum Phase {
 /// is yielded once, followed by permanent exhaustion. Decoding errors remain
 /// stored on their reliably framed fields or header preamble.
 ///
+/// A nonempty input whose first byte is not `<` starts with a header preamble
+/// and requires an EOH terminator. Input starting with `<` is parsed as records
+/// without a header. Text between fields or sections is ignored up to the next
+/// `<`; declared field-value lengths take precedence over embedded delimiters.
+///
 /// ```
 /// use qso_io::adif::{adi::{Parser, Section}, ParseOpts, ParseEncoding, LengthUnit};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,7 +65,9 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    /// Constructs a parser without reading input or detecting its encoding.
+    /// Constructs a parser using the supplied input and options.
+    ///
+    /// Parsing begins when the iterator advances.
     pub fn new(input: &'a [u8], options: ParseOpts) -> Self {
         Self {
             input: Stateful {
