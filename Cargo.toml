@@ -1,0 +1,11 @@
+[package]
+name = "qso-io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bstr = "1.13.1"
+chrono = "0.4.45"
+encoding_rs = "0.8.44"
+thiserror = "2.0.21"
+winnow = "1.0.5"

@@ -1,0 +1,5 @@
+# Preserve source encodings and original line endings in upstream files.
+*.adi -text
+*.adif -text
+LICENSE -text
+COPYING -text

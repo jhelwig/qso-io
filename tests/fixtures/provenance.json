@@ -1,0 +1,165 @@
+{
+  "description": "Unmodified upstream ADI fixtures and license files. Paths are relative to this directory. Git blob IDs and sizes are from the pinned upstream trees.",
+  "sources": [
+    {
+      "directory": "matir-adifparser",
+      "repository": "Matir/adifparser",
+      "revision": "2c465737f437b70867819bb986aa79722057bd1c",
+      "license": "BSD-2-Clause",
+      "files": [
+        {
+          "path": "matir-adifparser/COPYING",
+          "upstream_path": "COPYING",
+          "source_url": "https://raw.githubusercontent.com/Matir/adifparser/2c465737f437b70867819bb986aa79722057bd1c/COPYING",
+          "git_blob": "394c969103a3912d89675f4fbf13134118d596dc",
+          "bytes": 1321,
+          "kind": "license"
+        },
+        {
+          "path": "matir-adifparser/testdata/header_none.adi",
+          "upstream_path": "testdata/header_none.adi",
+          "source_url": "https://raw.githubusercontent.com/Matir/adifparser/2c465737f437b70867819bb986aa79722057bd1c/testdata/header_none.adi",
+          "git_blob": "022bc4c4f8b1a1f8b3b34edba7bd2e321fe67ef3",
+          "bytes": 22,
+          "kind": "fixture"
+        },
+        {
+          "path": "matir-adifparser/testdata/header_comment.adi",
+          "upstream_path": "testdata/header_comment.adi",
+          "source_url": "https://raw.githubusercontent.com/Matir/adifparser/2c465737f437b70867819bb986aa79722057bd1c/testdata/header_comment.adi",
+          "git_blob": "4b921240f364492f956f56ef325a75d2c34a8904",
+          "bytes": 71,
+          "kind": "fixture"
+        },
+        {
+          "path": "matir-adifparser/testdata/header_version.adi",
+          "upstream_path": "testdata/header_version.adi",
+          "source_url": "https://raw.githubusercontent.com/Matir/adifparser/2c465737f437b70867819bb986aa79722057bd1c/testdata/header_version.adi",
+          "git_blob": "014e4635e49ed138643cc3e3d2c4d0ae40d0b9eb",
+          "bytes": 42,
+          "kind": "fixture"
+        },
+        {
+          "path": "matir-adifparser/testdata/readrecord.adi",
+          "upstream_path": "testdata/readrecord.adi",
+          "source_url": "https://raw.githubusercontent.com/Matir/adifparser/2c465737f437b70867819bb986aa79722057bd1c/testdata/readrecord.adi",
+          "git_blob": "7487b68079b3ef3119567ed0ce0bdc952d9b9703",
+          "bytes": 58,
+          "kind": "fixture"
+        }
+      ]
+    },
+    {
+      "directory": "difa",
+      "repository": "cammeresi/adif",
+      "revision": "63783b458d52026d944af49594a7d2a5a397cdb8",
+      "license": "BSD-3-Clause",
+      "files": [
+        {
+          "path": "difa/LICENSE",
+          "upstream_path": "LICENSE",
+          "source_url": "https://raw.githubusercontent.com/cammeresi/adif/63783b458d52026d944af49594a7d2a5a397cdb8/LICENSE",
+          "git_blob": "67b3aae758f9cfe2db59756f6c5c0fa563ec11c2",
+          "bytes": 1481,
+          "kind": "license"
+        },
+        {
+          "path": "difa/examples/sample.adif",
+          "upstream_path": "examples/sample.adif",
+          "source_url": "https://raw.githubusercontent.com/cammeresi/adif/63783b458d52026d944af49594a7d2a5a397cdb8/examples/sample.adif",
+          "git_blob": "e3869c31ea0cf131140e4a138b889d7680c72f37",
+          "bytes": 326,
+          "kind": "fixture"
+        }
+      ]
+    },
+    {
+      "directory": "adif-parser-ts",
+      "repository": "k0swe/adif-parser-ts",
+      "revision": "a77ad183a79148749f9d9d21bd5f010fcd2dcf3f",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "adif-parser-ts/LICENSE",
+          "upstream_path": "LICENSE",
+          "source_url": "https://raw.githubusercontent.com/k0swe/adif-parser-ts/a77ad183a79148749f9d9d21bd5f010fcd2dcf3f/LICENSE",
+          "git_blob": "1b86ac71be218c8f6e0584f8ec34bf6143623755",
+          "bytes": 11342,
+          "kind": "license"
+        },
+        {
+          "path": "adif-parser-ts/test/data/wsjtx.adi",
+          "upstream_path": "test/data/wsjtx.adi",
+          "source_url": "https://raw.githubusercontent.com/k0swe/adif-parser-ts/a77ad183a79148749f9d9d21bd5f010fcd2dcf3f/test/data/wsjtx.adi",
+          "git_blob": "0ca7d2426ea51889125bc4bf0f0a195b23d32d50",
+          "bytes": 283,
+          "kind": "fixture"
+        },
+        {
+          "path": "adif-parser-ts/test/data/js8call.adi",
+          "upstream_path": "test/data/js8call.adi",
+          "source_url": "https://raw.githubusercontent.com/k0swe/adif-parser-ts/a77ad183a79148749f9d9d21bd5f010fcd2dcf3f/test/data/js8call.adi",
+          "git_blob": "604591857e5665237d8b556f5d6e653950cc3d4f",
+          "bytes": 310,
+          "kind": "fixture"
+        }
+      ]
+    },
+    {
+      "directory": "transadif",
+      "repository": "ham2k/transadif",
+      "revision": "90586ecf600623a51b560a2cfa3a443b3d9c8d56",
+      "license": "MIT",
+      "files": [
+        {
+          "path": "transadif/LICENSE",
+          "upstream_path": "LICENSE",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/LICENSE",
+          "git_blob": "ade747764ca9237f169a91aa666ffe8df420d86f",
+          "bytes": 1091,
+          "kind": "license"
+        },
+        {
+          "path": "transadif/test-cases/01-plain-examples/1-plain-ascii-in.adi",
+          "upstream_path": "test-cases/01-plain-examples/1-plain-ascii-in.adi",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/test-cases/01-plain-examples/1-plain-ascii-in.adi",
+          "git_blob": "ab75afa2fa2c19e083de43e1a9d01c1c4a9d9060",
+          "bytes": 311,
+          "kind": "fixture"
+        },
+        {
+          "path": "transadif/test-cases/01-plain-examples/2-plain-iso-in.adi",
+          "upstream_path": "test-cases/01-plain-examples/2-plain-iso-in.adi",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/test-cases/01-plain-examples/2-plain-iso-in.adi",
+          "git_blob": "791ccc7781ad0206f14a74a3f4eec01c7fd39422",
+          "bytes": 382,
+          "kind": "fixture"
+        },
+        {
+          "path": "transadif/test-cases/01-plain-examples/3-plain-utf-in.adi",
+          "upstream_path": "test-cases/01-plain-examples/3-plain-utf-in.adi",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/test-cases/01-plain-examples/3-plain-utf-in.adi",
+          "git_blob": "b23336c3fc37335acf33be1d1657dda67067478a",
+          "bytes": 317,
+          "kind": "fixture"
+        },
+        {
+          "path": "transadif/test-cases/02-field-length/1-undercount-in.adi",
+          "upstream_path": "test-cases/02-field-length/1-undercount-in.adi",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/test-cases/02-field-length/1-undercount-in.adi",
+          "git_blob": "489542a86134c63fa62cba40e4b746db481ed2d8",
+          "bytes": 564,
+          "kind": "fixture"
+        },
+        {
+          "path": "transadif/test-cases/02-field-length/2-overcount-in.adi",
+          "upstream_path": "test-cases/02-field-length/2-overcount-in.adi",
+          "source_url": "https://raw.githubusercontent.com/ham2k/transadif/90586ecf600623a51b560a2cfa3a443b3d9c8d56/test-cases/02-field-length/2-overcount-in.adi",
+          "git_blob": "79adbcd730ac3da5448712edfcc4befba4bcca31",
+          "bytes": 677,
+          "kind": "fixture"
+        }
+      ]
+    }
+  ]
+}
