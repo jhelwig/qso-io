@@ -296,8 +296,8 @@ pub(super) fn parse<'a>(
                     minutes,
                 })
             }
-            // Only descriptor indicators can reach this parser. ADX-only types are
-            // rejected before framing; the other categories have no indicator.
+            // ADX-only types are rejected before framing. Constituent character
+            // categories have no standalone ADI field conversion.
             Some(kind) => {
                 return Err(ContextError::from_external_error(
                     input,

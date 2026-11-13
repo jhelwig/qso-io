@@ -9,8 +9,6 @@ use winnow::{
     token::{take_till, take_until, take_while},
 };
 
-#[cfg(test)]
-use super::AdiFile;
 use crate::adif::{
     DataSpecifier, DataType, DecodeError, Field, LengthUnit, ParseEncoding, ParseOpts,
     adi::{Header, HeaderEntry, Record, Section, parser::error::AdiError},
@@ -43,7 +41,20 @@ enum Phase {
 ///
 /// Earlier sections remain usable if a later section fails. A structural error
 /// is yielded once, followed by permanent exhaustion. Decoding errors are
-/// terminal, including in field values and header preambles.
+/// terminal, including in field values and header preambles. Resolved standard,
+/// USERDEF and application-field types are validated before a section is yielded.
+/// Document rules belong to this parser independently of returned headers.
+///
+/// Historical enumeration members are accepted independently of QSO-date
+/// applicability. Primary subdivision membership spans the supplied country
+/// groups independently of record DXCC, without identifying or inferring a
+/// country. Recommended enumerations for String fields such as CONTEST_ID remain
+/// advisory during parsing.
+///
+/// Decoding rejects invalid input without replacement. ASCII failures identify
+/// the first non-ASCII byte; UTF-8 failures identify the invalid or incomplete
+/// sequence. Byte-length values are framed before decoding, while UTF-8 scalar
+/// lengths require valid scalar traversal to locate the value boundary.
 ///
 /// A nonempty input whose first byte is not `<` starts with a header preamble
 /// and requires an EOH terminator. Input starting with `<` is parsed as records
@@ -551,21 +562,6 @@ fn record<'a>(input: &mut Stream<'a>) -> Result<Record<'a>> {
     })
     .context(StrContext::Label("record"))
     .parse_next(input)
-}
-
-#[cfg(test)]
-fn adi_file<'a>(input: &mut Stream<'a>) -> Result<AdiFile<'a>> {
-    let header = match input.peek_token() {
-        None | Some(b'<') => None,
-        Some(_) => Some(header.parse_next(input)?),
-    };
-
-    let records = repeat_till(0.., record, eof)
-        .map(|(r, _)| r)
-        .context(StrContext::Label("adi file"))
-        .parse_next(input)?;
-
-    Ok(AdiFile { header, records })
 }
 
 #[cfg(test)]

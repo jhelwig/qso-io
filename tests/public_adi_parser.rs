@@ -760,3 +760,162 @@ fn inline_indicator_is_distinct_from_value_presence() {
         "field: {field:?}"
     );
 }
+
+#[test]
+fn document_rules_and_alternative_errors_are_available_to_consumers() {
+    use qso_io::adif::{DataType, Value};
+
+    let bytes = b"P<USERDEF1:5:N>SCORE<EOH><SCORE:3>123<APP_EXAMPLE_SCORE:1:N>1<EOR><APP_EXAMPLE_SCORE:1>2<EOR><CREDIT_GRANTED:8>AJA,NOPE<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    drop(next_section(&mut parser));
+    let first = record(next_section(&mut parser));
+    assert_eq!(named(&first, "SCORE").data_type(), Some(DataType::Number));
+    assert_eq!(named(&first, "SCORE").type_indicator(), None);
+    let second = record(next_section(&mut parser));
+    assert!(
+        matches!(named(&second, "APP_EXAMPLE_SCORE").value(), Some(Value::Number(n)) if n == &bigdecimal::BigDecimal::from(2)),
+        "{second:?}"
+    );
+    assert_eq!(named(&second, "APP_EXAMPLE_SCORE").type_indicator(), None);
+    let error = next_error(&mut parser);
+    let StructuralErrorKind::NoMatchingType { failures, .. } = error.kind() else {
+        panic!("expected both alternatives, got {error:?}");
+    };
+    assert_eq!(failures[0].enumeration(), Some("Credit"));
+    assert_eq!(failures[1].enumeration(), Some("Award"));
+    assert_eq!(&bytes[error.span()], b"AJA");
+    assert_eq!(&bytes[failures[1].span()], b"NOPE");
+    assert_exhausted(&mut parser);
+    assert_eq!(named(&first, "SCORE").text(), "123");
+}
+
+#[test]
+fn secondary_candidates_dispatch_prefixes_and_preserve_overlaps() {
+    use qso_io::adif::{
+        AlaskaCounty, SecondarySubdivision as S, primary_subdivisions::united_states,
+    };
+
+    let alaska: Vec<_> = S::candidates("aK,Aleutians East").collect();
+    assert_eq!(alaska, [S::Alaska(AlaskaCounty::AleutiansEast)]);
+    assert_eq!(AlaskaCounty::AleutiansEast.as_str(), "Aleutians East");
+    for code in ["AK,Imaginary", "AK,", "HI,", "ZZ,County", " AK,Anchorage"] {
+        let candidates: Vec<_> = S::candidates(code).collect();
+        assert!(
+            candidates.is_empty(),
+            "invalid {code:?} produced {candidates:?}"
+        );
+    }
+    assert_eq!(
+        S::candidates("hI,Hawaii").collect::<Vec<_>>(),
+        [S::Hawaii("Hawaii".into())]
+    );
+    assert_eq!(
+        S::candidates("ma,Franklin").collect::<Vec<_>>(),
+        [S::UnitedStates {
+            state: united_states::PrimarySubdivision::Massachusetts,
+            county: "Franklin".into(),
+        }]
+    );
+
+    let numeric: Vec<_> = S::candidates("01001").collect();
+    assert!(
+        numeric
+            .iter()
+            .any(|v| matches!(v, S::Japan(code) if code == "01001")),
+        "Japanese candidate missing: {numeric:?}"
+    );
+    assert!(
+        numeric
+            .iter()
+            .any(|v| matches!(v, S::Spain(code) if code == "01001")),
+        "Spanish candidate missing: {numeric:?}"
+    );
+    assert!(
+        !numeric.iter().any(|v| matches!(v, S::NewZealand(_))),
+        "five digits must not match NZ's three-digit format: {numeric:?}"
+    );
+    let district: Vec<_> = S::candidates("AB-01").collect();
+    assert!(
+        district
+            .iter()
+            .any(|v| matches!(v, S::AsiaticRussia(code) if code == "AB-01")),
+        "Russian candidate missing: {district:?}"
+    );
+    assert!(
+        district
+            .iter()
+            .any(|v| matches!(v, S::Ukraine(code) if code == "AB-01")),
+        "Ukrainian candidate missing: {district:?}"
+    );
+}
+
+#[test]
+fn alternate_subdivisions_dispatch_to_suffix_only_members() {
+    use qso_io::adif::{NzRegionDistrict, SecondarySubdivisionAlt as S};
+
+    assert_eq!(
+        S::parse_member("nz_regions:Hawkes Bay/Wairoa"),
+        Some(S::NzRegions(NzRegionDistrict::HawkesBayWairoa))
+    );
+    assert_eq!(
+        NzRegionDistrict::HawkesBayWairoa.as_str(),
+        "Hawkes Bay/Wairoa"
+    );
+    for member in [
+        "NZ_Regions:Imaginary",
+        "NZ_Regions:",
+        ":Unlisted",
+        "OTHER:",
+        "OTHER",
+    ] {
+        assert_eq!(
+            S::parse_member(member),
+            None,
+            "invalid alternate member {member:?}"
+        );
+    }
+    assert_eq!(
+        S::parse_member("Other:Unlisted"),
+        Some(S::Other {
+            enumeration: "Other".into(),
+            code: "Unlisted".into(),
+        })
+    );
+}
+
+#[test]
+fn sponsor_components_compose_with_award_lists_and_preserve_diagnostics() {
+    use qso_io::adif::{AwardSponsor, Value, ValueError};
+
+    let value = format!(
+        "{}_PROGRAM_AWARD,cq_OTHER_UNKNOWN",
+        AwardSponsor::Arrl.as_str()
+    );
+    let bytes = format!("<AWARD_GRANTED:{}>{value}<EOR>", value.len());
+    let mut parser = Parser::new(bytes.as_bytes(), ParseOpts::default());
+    let parsed = record(next_section(&mut parser));
+    let award = named(&parsed, "AWARD_GRANTED");
+    assert_eq!(award.text(), value);
+    assert!(
+        matches!(award.value(), Some(Value::List(members)) if members == &["ARRL_PROGRAM_AWARD", "cq_OTHER_UNKNOWN"]),
+        "{award:?}"
+    );
+    assert_exhausted(&mut parser);
+
+    let value = "arrl_PROGRAM_AWARD,NOPE_PROGRAM_AWARD";
+    let descriptor = format!("<AWARD_GRANTED:{}>", value.len());
+    let bytes = format!("{descriptor}{value}<EOR><CALL:1>X<EOR>");
+    let mut parser = Parser::new(bytes.as_bytes(), ParseOpts::default());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(error.kind(), StructuralErrorKind::InvalidValue {
+        field_name, cause: ValueError::InvalidSponsoredAwardList,
+        enumeration: Some("Award_Sponsor"), ..
+    } if field_name == "AWARD_GRANTED"),
+        "{error:?}"
+    );
+    let start = descriptor.len() + "arrl_PROGRAM_AWARD,".len();
+    assert_eq!(error.span(), start..start + "NOPE_".len(), "{error}");
+    assert_eq!(&bytes.as_bytes()[error.span()], b"NOPE_");
+    assert_exhausted(&mut parser);
+}

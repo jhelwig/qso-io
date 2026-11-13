@@ -5,12 +5,12 @@ use thiserror::Error;
 
 use crate::adif::{DataSpecifier, DataType, Field};
 
-/// An ordinary header field or a structured user-field declaration, in source order.
+/// A header field or USERDEF declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderEntry<'a> {
-    /// An ordinary field whose indicator describes its own contents.
+    /// A header field.
     Field(Field<'a>),
-    /// A declaration whose indicator describes a named record field.
+    /// A declaration for a user-defined record field.
     UserDefinition(UserDefinition<'a>),
 }
 

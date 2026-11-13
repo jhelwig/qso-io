@@ -26,7 +26,7 @@ pub enum SyntaxErrorKind {
     InvalidNameEncoding,
 }
 
-/// Structured details of a terminal ADI parsing failure.
+/// The kind of an ADI parsing error.
 #[derive(Debug, Clone)]
 pub enum StructuralErrorKind {
     /// Two USERDEF declarations name the same record field ignoring ASCII case.
@@ -101,7 +101,7 @@ pub enum StructuralErrorKind {
         /// Expected standard enumeration when membership failed.
         enumeration: Option<&'static str>,
     },
-    /// A USERDEFn declaration failed its own grammar or range requirements.
+    /// An invalid USERDEF declaration.
     InvalidUserDefinition {
         /// Original descriptor name.
         field_name: String,
@@ -157,7 +157,6 @@ impl TypeAlternativeFailure {
 ///
 /// Spans have exclusive ends. Truncated values and missing terminators have an
 /// empty span at input length; invalid bounded values can point inside the input.
-/// Display reports the byte range and error details.
 #[derive(Debug)]
 pub struct StructuralError {
     span: Range<usize>,
@@ -174,7 +173,7 @@ impl StructuralError {
         self.span.clone()
     }
 
-    /// Borrows structured details independently of the formatted message.
+    /// Returns the error kind.
     pub fn kind(&self) -> &StructuralErrorKind {
         &self.kind
     }
@@ -324,6 +323,7 @@ impl StructuralError {
 }
 
 impl fmt::Display for StructuralError {
+    /// Formats the error's byte range and description.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,

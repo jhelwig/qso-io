@@ -4,17 +4,17 @@ use bigdecimal::{BigDecimal, num_bigint::BigInt};
 use chrono::{NaiveDate, NaiveTime};
 use thiserror::Error;
 
-/// A stored ADI value parsed using its explicit indicator, or untyped text.
+/// An ADIF field value.
 ///
-/// Empty contents are represented by Field::value returning None. This enum is
-/// exhaustive; its text representation is shared by the declared text types.
+/// This enum is exhaustive. Its text representation is shared by untyped
+/// contents and the declared text types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value<'a> {
     /// Original decoded text, retaining its spelling.
     Text(Cow<'a, str>),
     /// Top-level list members in source order, retaining compound member spelling.
     List(Vec<Cow<'a, str>>),
-    /// ADIF Y/y or N/n parsed as a Boolean.
+    /// The Boolean value represented by ADIF Y/y or N/n.
     Boolean(bool),
     /// An exact Integer or PositiveInteger value.
     Integer(BigInt),
@@ -94,7 +94,7 @@ pub enum Hemisphere {
     West,
 }
 
-/// The declared ADIF type whose value grammar failed.
+/// The reason an ADIF value violates its type grammar or applicable member set.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ValueError {
     /// Invalid AwardList grammar, cardinality, or applicable membership.
@@ -165,7 +165,7 @@ pub enum ValueError {
     /// A MultilineString character or line break fails the selected rules.
     #[error("invalid MultilineString")]
     InvalidMultilineString,
-    /// An Enumeration value fails the selected String character rules.
+    /// An Enumeration fails its text repertoire or applicable member set.
     #[error("invalid Enumeration")]
     InvalidEnumeration,
 }

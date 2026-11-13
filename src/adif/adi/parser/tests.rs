@@ -1,8 +1,7 @@
-//! ADIF 3.1.8 IV.A.1–6 framing tests and the crate's explicit encoding policies.
+//! ADI framing, typed values, document definitions and source-located errors.
 //!
-//! These exercise qso-io's assembly, boundaries and error separation, not ADIF
-//! schema validation or the underlying libraries in isolation. Fixture
-//! expectations follow tests/fixtures/README.md, not upstream filenames.
+//! These tests exercise qso-io's parsing contracts and encoding policies.
+//! Fixture expectations follow tests/fixtures/README.md, not upstream filenames.
 
 use super::error::StructuralError;
 use super::*;
@@ -13,6 +12,12 @@ mod decoding;
 mod definitions;
 mod lists;
 mod values;
+
+#[derive(Debug)]
+struct ParsedSections<'a> {
+    header: Option<Header<'a>>,
+    records: Vec<Record<'a>>,
+}
 
 #[track_caller]
 fn next_section<'a>(parser: &mut Parser<'a>) -> Section<'a> {
@@ -72,8 +77,22 @@ fn ascii_stream(bytes: &[u8]) -> Stream<'_> {
     stream(bytes, ParseEncoding::Ascii, LengthUnit::Bytes)
 }
 
+fn adi_file<'a>(input: &mut Stream<'a>) -> Result<ParsedSections<'a>> {
+    let header = match input.peek_token() {
+        None | Some(b'<') => None,
+        Some(_) => Some(header.parse_next(input)?),
+    };
+
+    let records = repeat_till(0.., record, eof)
+        .map(|(r, _)| r)
+        .context(StrContext::Label("adi file"))
+        .parse_next(input)?;
+
+    Ok(ParsedSections { header, records })
+}
+
 #[track_caller]
-fn parse_file(bytes: &[u8], encoding: ParseEncoding, unit: LengthUnit) -> AdiFile<'_> {
+fn parse_file(bytes: &[u8], encoding: ParseEncoding, unit: LengthUnit) -> ParsedSections<'_> {
     adi_file
         .parse(stream(bytes, encoding, unit))
         .unwrap_or_else(|error| {
