@@ -3,7 +3,9 @@ use std::{error::Error as StdError, fmt, num::ParseIntError, ops::Range};
 use thiserror::Error;
 use winnow::error::{ContextError, StrContext, StrContextValue};
 
-use crate::adif::{DataType, DataTypeError, DecodeError, LengthUnit, adi::UserDefinitionError};
+use crate::adif::{
+    DataType, DataTypeError, DecodeError, LengthUnit, ValueError, adi::UserDefinitionError,
+};
 
 /// The syntactic requirement that an ADI input failed to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,13 @@ pub enum StructuralErrorKind {
         first_span: Range<usize>,
         /// Repeated descriptor's original byte range and primary error location.
         second_span: Range<usize>,
+    },
+    /// Nonempty field contents fail their explicit ADIF type grammar.
+    InvalidValue {
+        /// Original field name.
+        field_name: String,
+        /// Declared type whose grammar failed.
+        cause: ValueError,
     },
     /// A USERDEFn declaration failed its own grammar or range requirements.
     InvalidUserDefinition {
@@ -130,6 +139,16 @@ impl StructuralError {
                         },
                         second_span,
                         None,
+                    ),
+                    AdiError::InvalidValue {
+                        field_name,
+                        span,
+                        cause,
+                        numeric_cause,
+                    } => (
+                        StructuralErrorKind::InvalidValue { field_name, cause },
+                        span,
+                        numeric_cause.map(|e| Box::new(e) as _),
                     ),
                     AdiError::InvalidUserDefinition {
                         field_name,
@@ -258,6 +277,9 @@ impl fmt::Display for StructuralError {
                 "duplicate field {field_name}; first descriptor at bytes {}..{}",
                 first_span.start, first_span.end
             ),
+            StructuralErrorKind::InvalidValue { field_name, cause } => {
+                write!(f, "invalid value for {field_name}: {cause}")
+            }
             StructuralErrorKind::InvalidUserDefinition { field_name, cause } => {
                 write!(f, "invalid declaration {field_name}: {cause}")
             }
@@ -277,6 +299,9 @@ impl StdError for StructuralError {
             return Some(cause);
         }
         if let Some(cause) = self.cause.as_deref() {
+            return Some(cause);
+        }
+        if let StructuralErrorKind::InvalidValue { cause, .. } = &self.kind {
             return Some(cause);
         }
         if let StructuralErrorKind::InvalidUserDefinition { cause, .. } = &self.kind {
@@ -302,6 +327,13 @@ pub(super) enum AdiError {
         declared: usize,
         available: usize,
         unit: LengthUnit,
+    },
+    #[error("invalid value for {field_name}: {cause}")]
+    InvalidValue {
+        field_name: String,
+        span: Range<usize>,
+        cause: ValueError,
+        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
     },
     #[error("invalid declaration {field_name}: {cause}")]
     InvalidUserDefinition {

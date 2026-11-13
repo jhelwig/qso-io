@@ -9,6 +9,7 @@ use super::*;
 
 mod declarations;
 mod decoding;
+mod values;
 
 #[track_caller]
 fn next_section<'a>(parser: &mut Parser<'a>) -> Section<'a> {
@@ -249,25 +250,28 @@ fn unknown_empty_and_multiple_type_indicators_fail_structurally() {
 }
 
 #[test]
-fn invalid_field_values_do_not_invalidate_descriptor_syntax() {
-    for (bytes, raw, expected_type) in [
+fn invalid_declared_field_values_are_structural_errors() {
+    use crate::adif::ValueError;
+    for (bytes, reason, span) in [
         (
             &b"<QSO_DATE:8:D>20260230"[..],
-            &b"20260230"[..],
-            DataType::Date,
+            ValueError::InvalidDate,
+            20..22,
         ),
         (
             &b"<APP_TEST_VALUE:3:N>abc"[..],
-            &b"abc"[..],
-            DataType::Number,
+            ValueError::InvalidNumber,
+            20..21,
         ),
     ] {
-        let mut input = ascii_stream(bytes);
-        let parsed = field(&mut input).unwrap();
-        assert_eq!(parsed.raw_data, raw);
-        assert_eq!(parsed.text().as_bytes(), raw);
-        assert_eq!(parsed.specifier.data_type, Some(expected_type));
-        assert_eq!(input.eof_offset(), 0);
+        let mut parser = Parser::new(bytes, ParseOpts::default());
+        let error = next_error(&mut parser);
+        assert_eq!(error.span(), span);
+        assert!(
+            matches!(error.kind(),error::StructuralErrorKind::InvalidValue {cause,..} if *cause==reason),
+            "unexpected value: {:?}",
+            error.kind()
+        );
     }
 }
 

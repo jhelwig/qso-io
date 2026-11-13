@@ -20,6 +20,7 @@ mod declarations;
 pub(super) mod error;
 #[cfg(test)]
 mod tests;
+mod values;
 
 #[derive(Debug)]
 struct State {
@@ -238,13 +239,7 @@ struct FramedField<'a> {
 fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
     let f = framed_field(input)?;
 
-    Ok(Field {
-        specifier: f.specifier,
-        raw_data: f.raw_data,
-        descriptor_span: f.descriptor_span,
-        value_span: f.value_span,
-        text: f.text,
-    })
+    values::parse(input, f)
 }
 
 fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
@@ -253,13 +248,7 @@ fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
     if declarations::is_declaration(&f.specifier.name) {
         declarations::parse(input, f).map(HeaderEntry::UserDefinition)
     } else {
-        Ok(HeaderEntry::Field(Field {
-            specifier: f.specifier,
-            raw_data: f.raw_data,
-            descriptor_span: f.descriptor_span,
-            value_span: f.value_span,
-            text: f.text,
-        }))
+        values::parse(input, f).map(HeaderEntry::Field)
     }
 }
 
@@ -550,20 +539,12 @@ mod test {
         let parsed = field(&mut basic)
             .expect("NAME should parse because its three supplied bytes match the declared length");
 
-        assert_eq!(
-            Field {
-                specifier: DataSpecifier {
-                    name: Cow::Owned("NAME".to_owned()),
-                    length: 3,
-                    data_type: None,
-                },
-                raw_data: "Ray".as_bytes(),
-                descriptor_span: 0..8,
-                value_span: 8..11,
-                text: Cow::Owned("Ray".to_owned()),
-            },
-            parsed
-        )
+        assert_eq!(parsed.name(), "NAME");
+        assert_eq!(parsed.raw_data(), b"Ray");
+        assert_eq!(parsed.text(), "Ray");
+        assert_eq!(parsed.descriptor_span(), 0..8);
+        assert_eq!(parsed.value_span(), 8..11);
+        assert_eq!(parsed.data_type(), None);
     }
 
     #[test]

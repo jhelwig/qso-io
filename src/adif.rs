@@ -8,11 +8,14 @@ use std::{borrow::Cow, ops::Range, str::Utf8Error};
 use chrono::NaiveDate;
 use thiserror::Error;
 
+pub use value::{AdifLocation, AdifTime, Hemisphere, TimePrecision, Value, ValueError};
+
 /// Borrowed ADI sections, their parser, and structural diagnostics.
 pub mod adi;
 mod number;
 mod parser;
 mod text;
+mod value;
 
 /// Explicit text encoding and declared-length interpretation for one parser.
 ///
@@ -64,7 +67,8 @@ pub struct Field<'a> {
     raw_data: &'a [u8],
     descriptor_span: Range<usize>,
     value_span: Range<usize>,
-    text: Cow<'a, str>,
+    text: Option<Cow<'a, str>>,
+    value: Option<Value<'a>>,
 }
 
 impl<'a> Field<'a> {
@@ -83,7 +87,7 @@ impl<'a> Field<'a> {
         self.specifier.data_type
     }
 
-    /// Borrows the original value bytes, including any bytes that fail decoding.
+    /// Borrows the original value bytes.
     pub fn raw_data(&self) -> &'a [u8] {
         self.raw_data
     }
@@ -105,7 +109,15 @@ impl<'a> Field<'a> {
 
     /// Borrows the original decoded spelling retained during parsing.
     pub fn text(&self) -> &str {
-        &self.text
+        match &self.value {
+            Some(Value::Text(text)) => text,
+            _ => self.text.as_deref().unwrap_or(""),
+        }
+    }
+
+    /// Borrows the stored value, or returns None for supplied zero-length contents.
+    pub fn value(&self) -> Option<&Value<'a>> {
+        self.value.as_ref()
     }
 }
 

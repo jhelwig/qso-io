@@ -408,3 +408,41 @@ fn headers_distinguish_definitions_from_fields() {
         "123"
     );
 }
+
+#[test]
+fn values_preserve_absence_empty_contents_and_source_spelling() {
+    use qso_io::adif::{DataType, Value};
+    let bytes = b"<A:0><B:0:N><C:3>123<D:3:S>123<E:8:N>001.2300<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let rec = record(next_section(&mut parser));
+    assert!(
+        rec.field("X").is_none(),
+        "expected X to be absent, got {:?}",
+        rec.field("X")
+    );
+    for name in ["A", "B"] {
+        let f = named(&rec, name);
+        assert_eq!(f.value(), None, "expected empty field {name:?}, got {f:?}");
+        assert_eq!(f.text(), "");
+    }
+    assert_eq!(named(&rec, "A").data_type(), None);
+    assert_eq!(named(&rec, "B").data_type(), Some(DataType::Number));
+    for name in ["C", "D"] {
+        assert!(
+            matches!(named(&rec, name).value(),Some(Value::Text(s)) if s=="123"),
+            "unexpected value: {:?}",
+            named(&rec, name).value()
+        );
+    }
+    let number = named(&rec, "E");
+    assert!(
+        matches!(number.value(),Some(Value::Number(n)) if n == &"1.2300".parse::<bigdecimal::BigDecimal>().expect("expected decimal should parse because its fixed test spelling uses decimal notation")),
+        "unexpected value: {:?}",
+        number.value()
+    );
+    assert_eq!(number.text(), "001.2300");
+    assert_eq!(number.raw_data(), b"001.2300");
+    for f in rec.fields() {
+        assert_eq!(&bytes[f.value_span()], f.raw_data());
+    }
+}
