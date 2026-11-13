@@ -84,7 +84,8 @@ pub enum StructuralErrorKind {
 
 /// A structural error located in the original input byte slice.
 ///
-/// Spans have exclusive ends. EOF failures have an empty span at input length.
+/// Spans have exclusive ends. Truncated values and missing terminators have an
+/// empty span at input length; invalid bounded values can point inside the input.
 /// Display reports the byte range and error details.
 #[derive(Debug)]
 pub struct StructuralError {

@@ -1,8 +1,6 @@
-//! Read ADI records while preserving their original bytes and source locations.
+//! Amateur-radio contact data interchange.
 //!
-//! Start with [`adif::adi::Parser`] and [`adif::ParseOpts`]. Parsing yields complete
-//! headers and records. Structural errors, including text-decoding failures,
-//! terminate iteration while leaving previously yielded sections available.
+//! Format-specific APIs are organized into modules. See [`adif`] for ADIF
+//! types and ADI parsing.
 
-/// ADIF parsing options, parsed fields, and reference data types.
 pub mod adif;

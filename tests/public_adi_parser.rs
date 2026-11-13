@@ -446,3 +446,123 @@ fn values_preserve_absence_empty_contents_and_source_spelling() {
         assert_eq!(&bytes[f.value_span()], f.raw_data());
     }
 }
+
+#[test]
+fn composite_values_and_definitions_outlive_the_parser() {
+    use qso_io::adif::{Hemisphere, TimePrecision, Value};
+    let bytes=b"P<USERDEF1:3:N>EPC<EOH><A:4:S>Jos\xe9<B:1:B>y<C:2:N>1.<D:8:D>20240229<E:4:T>1305<F:11:L>W122 30.125<EOR><E:6:T>130500<EPC:3>123<EOR>";
+    let sections = {
+        let parser = Parser::new(
+            bytes,
+            ParseOpts {
+                encoding: ParseEncoding::Latin1,
+                field_length: LengthUnit::Bytes,
+            },
+        );
+        parser
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| {
+                panic!("input {bytes:?}: expected complete sections, got {error:?}")
+            })
+    };
+    assert_eq!(sections.len(), 3);
+    let Section::Header(header) = &sections[0] else {
+        panic!("expected Section::Header(header), got {:?}", sections[0]);
+    };
+    let def = definition(&header.entries()[0]);
+    assert_eq!(def.field_name(), "EPC");
+    assert_eq!(&bytes[def.value_span()], def.raw_data());
+    let Section::Record(first) = &sections[1] else {
+        panic!("expected Section::Record(first), got {:?}", sections[1]);
+    };
+    assert_eq!(first.fields().len(), 6);
+    for (field, expected) in first
+        .fields()
+        .iter()
+        .zip(["text", "boolean", "number", "date", "time", "location"])
+    {
+        let kind = match field
+            .value()
+            .unwrap_or_else(|| panic!("expected a nonempty value, got {field:?}"))
+        {
+            Value::Text(s) => {
+                assert_eq!(s, "José");
+                "text"
+            }
+            Value::Boolean(b) => {
+                assert!(*b);
+                "boolean"
+            }
+            Value::Number(n) => {
+                assert_eq!(n, &bigdecimal::BigDecimal::from(1));
+                "number"
+            }
+            Value::Date(d) => {
+                assert_eq!(d.to_string(), "2024-02-29");
+                "date"
+            }
+            Value::Time(t) => {
+                assert_eq!(t.precision(), TimePrecision::Minute);
+                assert_eq!(t.time().to_string(), "13:05:00");
+                "time"
+            }
+            Value::Location(l) => {
+                assert_eq!(l.hemisphere(), Hemisphere::West);
+                assert_eq!(l.degrees(), 122);
+                assert_eq!(
+                    l.minutes(),
+                    &"30.125"
+                        .parse::<bigdecimal::BigDecimal>()
+                        .expect("expected decimal should parse because its fixed test spelling uses decimal notation")
+                );
+                "location"
+            }
+        };
+        assert_eq!(kind, expected);
+        assert_eq!(&bytes[field.value_span()], field.raw_data());
+    }
+    assert_eq!(named(first, "C").text(), "1.");
+    let Section::Record(second) = &sections[2] else {
+        panic!("expected Section::Record(second), got {:?}", sections[2]);
+    };
+    let Some(Value::Time(t)) = named(second, "E").value() else {
+        panic!(
+            "expected Some(Value::Time(t)), got {:?}",
+            named(second, "E").value()
+        );
+    };
+    assert_eq!(t.precision(), TimePrecision::Second);
+    assert_eq!(t.time().to_string(), "13:05:00");
+    assert!(
+        matches!(named(second, "EPC").value(),Some(Value::Text(s)) if s=="123"),
+        "unexpected value: {:?}",
+        named(second, "EPC").value()
+    );
+}
+
+#[test]
+fn latin1_declaration_error_uses_original_bytes_after_an_accent() {
+    use qso_io::adif::adi::UserDefinitionError;
+    let bytes = b"P<PROGRAMID:1>A<USERDEF1:8:E>X\xe9,{A,\x85}<EOH>";
+    let mut parser = Parser::new(
+        bytes,
+        ParseOpts {
+            encoding: ParseEncoding::Latin1,
+            field_length: LengthUnit::Bytes,
+        },
+    );
+    let error = next_error(&mut parser);
+    assert_eq!(error.span(), 35..36);
+    assert!(
+        matches!(
+            error.kind(),
+            StructuralErrorKind::InvalidUserDefinition {
+                cause: UserDefinitionError::InvalidEnumeration,
+                ..
+            }
+        ),
+        "unexpected value: {:?}",
+        error.kind()
+    );
+    assert_exhausted(&mut parser);
+}
