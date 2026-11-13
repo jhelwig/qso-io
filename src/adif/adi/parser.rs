@@ -27,6 +27,7 @@ mod values;
 struct State {
     parser_options: ParseOpts,
     user_definitions: HashMap<String, definitions::UserFieldRule>,
+    application_types: HashMap<String, definitions::EstablishedApplicationType>,
 }
 
 type Stream<'is> = Stateful<LocatingSlice<&'is [u8]>, State>;
@@ -240,7 +241,9 @@ struct FramedField<'a> {
     text: Cow<'a, str>,
 }
 
-fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
+fn prepared_field<'a>(
+    input: &mut Stream<'a>,
+) -> Result<(Field<'a>, definitions::ResolvedDefinition)> {
     let (specifier, span) = data_specifier.with_span().parse_next(input)?;
     let resolution = definitions::resolve(
         &input.state,
@@ -253,7 +256,12 @@ fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
     let parsed = definitions::parse_resolved(input, f, &resolution)?;
     definitions::check_user_constraints(&input.state, &parsed)
         .map_err(|error| ContextError::from_external_error(input, error))?;
-    Ok(parsed)
+    Ok((parsed, resolution))
+}
+
+#[cfg(test)]
+fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
+    prepared_field(input).map(|(field, _)| field)
 }
 
 fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
@@ -500,7 +508,7 @@ fn unique_field<'a>(
     seen: &mut HashMap<String, Range<usize>>,
 ) -> Result<Field<'a>> {
     let checkpoint = input.checkpoint();
-    let parsed = field.parse_next(input)?;
+    let (parsed, resolution) = prepared_field(input)?;
     let key = parsed.name().to_ascii_uppercase();
 
     if let Some(first_span) = seen.get(&key) {
@@ -514,6 +522,7 @@ fn unique_field<'a>(
     }
 
     seen.insert(key, parsed.descriptor_span());
+    definitions::register_application(&mut input.state, &parsed, &resolution);
     Ok(parsed)
 }
 

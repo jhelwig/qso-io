@@ -105,11 +105,32 @@ pub(super) fn resolve(
                 .map_or(TypeSelection::Untyped, TypeSelection::Single)
         }
     } else if source == DefinitionSource::Application {
-        TypeSelection::Single(
-            specifier
-                .type_indicator
-                .unwrap_or(DataType::MultilineString),
-        )
+        if let Some(established) = state
+            .application_types
+            .get(&specifier.name.to_ascii_uppercase())
+        {
+            if let Some(supplied) = specifier.type_indicator
+                && supplied != established.data_type
+            {
+                return Err(AdiError::Defined {
+                    numeric_cause: None,
+                    span: descriptor_span,
+                    kind: Box::new(StructuralErrorKind::TypeConflict {
+                        field_name: specifier.name.to_string(),
+                        expected: vec![established.data_type],
+                        supplied,
+                        definition_span: Some(established.first_descriptor_span.clone()),
+                    }),
+                });
+            }
+            TypeSelection::Single(established.data_type)
+        } else {
+            TypeSelection::Single(
+                specifier
+                    .type_indicator
+                    .unwrap_or(DataType::MultilineString),
+            )
+        }
     } else {
         specifier
             .type_indicator
@@ -321,4 +342,28 @@ pub(super) fn check_user_constraints(state: &State, field: &Field<'_>) -> Result
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub(super) struct EstablishedApplicationType {
+    data_type: DataType,
+    first_descriptor_span: Range<usize>,
+}
+
+pub(super) fn register_application(
+    state: &mut State,
+    field: &Field<'_>,
+    resolution: &ResolvedDefinition,
+) {
+    if resolution.source == DefinitionSource::Application
+        && let Some(data_type) = field.data_type()
+    {
+        state
+            .application_types
+            .entry(field.name().to_ascii_uppercase())
+            .or_insert_with(|| EstablishedApplicationType {
+                data_type,
+                first_descriptor_span: field.descriptor_span(),
+            });
+    }
 }

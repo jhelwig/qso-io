@@ -7,6 +7,7 @@
 use super::error::StructuralError;
 use super::*;
 
+mod applications;
 mod declarations;
 mod decoding;
 mod definitions;
