@@ -566,3 +566,26 @@ fn latin1_declaration_error_uses_original_bytes_after_an_accent() {
     );
     assert_exhausted(&mut parser);
 }
+
+#[test]
+fn inline_indicator_is_distinct_from_value_presence() {
+    use qso_io::adif::{DataType, Value};
+
+    let mut parser = Parser::new(b"<X:0:N><EOR><X:3>123<EOR>", ParseOpts::default());
+    let empty = record(next_section(&mut parser));
+    let field = named(&empty, "X");
+    assert_eq!(field.data_type(), Some(DataType::Number));
+    assert_eq!(field.type_indicator(), Some(DataType::Number));
+    assert!(field.value().is_none(), "empty field: {field:?}");
+    assert_eq!(field.text(), "");
+    assert_eq!(field.raw_data(), b"");
+
+    let untyped = record(next_section(&mut parser));
+    let field = named(&untyped, "X");
+    assert_eq!(field.data_type(), None);
+    assert_eq!(field.type_indicator(), None);
+    assert!(
+        matches!(field.value(), Some(Value::Text(text)) if text == "123"),
+        "field: {field:?}"
+    );
+}

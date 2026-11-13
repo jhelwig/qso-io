@@ -162,7 +162,7 @@ fn descriptors_preserve_names_and_accept_zero_and_leading_zero_lengths() {
         let parsed = parse_ok(data_specifier, &mut input);
         assert_eq!(parsed.name, name);
         assert_eq!(parsed.length, length);
-        assert_eq!(parsed.data_type, None);
+        assert_eq!(parsed.type_indicator, None);
         assert_eq!(
             *input.input.as_ref(),
             &bytes[bytes.iter().position(|b| *b == b'>').expect(
@@ -206,7 +206,11 @@ fn all_defined_type_indicators_are_case_insensitive() {
                 continue;
             }
             let parsed = parse_ok(field, &mut input);
-            assert_eq!(parsed.specifier.data_type, Some(expected), "{supplied}");
+            assert_eq!(
+                parsed.specifier.type_indicator,
+                Some(expected),
+                "{supplied}"
+            );
             assert_eq!(parsed.raw_data, b"");
             assert_eq!(*input.input.as_ref(), b"<EOR>");
         }

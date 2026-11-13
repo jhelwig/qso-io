@@ -152,6 +152,7 @@ pub enum LengthUnit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field<'a> {
     specifier: DataSpecifier<'a>,
+    data_type: Option<DataType>,
     raw_data: &'a [u8],
     descriptor_span: Range<usize>,
     value_span: Range<usize>,
@@ -170,9 +171,14 @@ impl<'a> Field<'a> {
         self.specifier.length
     }
 
-    /// Returns the data type identified by the descriptor's optional indicator.
+    /// Returns the resolved ADIF type, or None for unresolved untyped contents.
     pub fn data_type(&self) -> Option<DataType> {
-        self.specifier.data_type
+        self.data_type
+    }
+
+    /// Returns the type named by the optional inline descriptor indicator.
+    pub fn type_indicator(&self) -> Option<DataType> {
+        self.specifier.type_indicator
     }
 
     /// Borrows the original value bytes.
@@ -232,7 +238,7 @@ pub enum DecodeError {
 struct DataSpecifier<'a> {
     name: Cow<'a, str>,
     length: usize,
-    data_type: Option<DataType>,
+    type_indicator: Option<DataType>,
 }
 
 /// ADIF value categories and their optional descriptor indicators.

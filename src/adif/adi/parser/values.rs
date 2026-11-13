@@ -35,7 +35,11 @@ fn width(bytes: &[u8], size: usize) -> std::result::Result<(), Range<usize>> {
     }
 }
 
-pub(super) fn parse<'a>(input: &Stream<'a>, f: FramedField<'a>) -> Result<Field<'a>> {
+pub(super) fn parse<'a>(
+    input: &Stream<'a>,
+    f: FramedField<'a>,
+    resolved_type: Option<DataType>,
+) -> Result<Field<'a>> {
     let raw = f.raw_data;
     let fail = |cause, span: Range<usize>, numeric_cause| {
         ContextError::from_external_error(
@@ -53,7 +57,7 @@ pub(super) fn parse<'a>(input: &Stream<'a>, f: FramedField<'a>) -> Result<Field<
     let value = if raw.is_empty() {
         None
     } else {
-        Some(match f.specifier.data_type {
+        Some(match resolved_type {
             None => Value::Text(mem::take(&mut text)),
             Some(kind @ (DataType::String | DataType::MultilineString | DataType::Enumeration)) => {
                 let reason = match kind {
@@ -198,6 +202,7 @@ pub(super) fn parse<'a>(input: &Stream<'a>, f: FramedField<'a>) -> Result<Field<
 
     Ok(Field {
         specifier: f.specifier,
+        data_type: resolved_type,
         raw_data: raw,
         descriptor_span: f.descriptor_span,
         value_span: f.value_span,

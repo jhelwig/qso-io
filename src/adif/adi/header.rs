@@ -71,7 +71,7 @@ impl<'a> UserDefinition<'a> {
 
     /// Returns the supplied record-field type indicator, or None when omitted.
     pub fn data_type(&self) -> Option<DataType> {
-        self.specifier.data_type
+        self.specifier.type_indicator
     }
 
     /// Borrows the optional parsed enumeration or numeric range.

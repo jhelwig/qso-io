@@ -238,8 +238,9 @@ struct FramedField<'a> {
 
 fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
     let f = framed_field(input)?;
+    let kind = f.specifier.type_indicator;
 
-    values::parse(input, f)
+    values::parse(input, f, kind)
 }
 
 fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
@@ -248,7 +249,8 @@ fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
     if declarations::is_declaration(&f.specifier.name) {
         declarations::parse(input, f).map(HeaderEntry::UserDefinition)
     } else {
-        values::parse(input, f).map(HeaderEntry::Field)
+        let kind = f.specifier.type_indicator;
+        values::parse(input, f, kind).map(HeaderEntry::Field)
     }
 }
 
@@ -276,6 +278,14 @@ fn unique_header_entry<'a>(
 
 fn framed_field<'a>(input: &mut Stream<'a>) -> Result<FramedField<'a>> {
     let (specifier, descriptor_span) = data_specifier.with_span().parse_next(input)?;
+    frame_value(input, specifier, descriptor_span)
+}
+
+fn frame_value<'a>(
+    input: &mut Stream<'a>,
+    specifier: DataSpecifier<'a>,
+    descriptor_span: Range<usize>,
+) -> Result<FramedField<'a>> {
     if specifier.length == 0 {
         return Ok(FramedField {
             specifier,
@@ -424,7 +434,7 @@ fn data_specifier<'a>(input: &mut Stream<'a>) -> Result<DataSpecifier<'a>> {
         Ok::<_, std::string::FromUtf8Error>(DataSpecifier {
             name,
             length,
-            data_type,
+            type_indicator: data_type,
         })
     })
     .context(StrContext::Label("data specifier"))

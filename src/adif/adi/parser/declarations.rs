@@ -77,7 +77,7 @@ pub(super) fn parse<'a>(input: &Stream<'a>, framed: FramedField<'a>) -> Result<U
         let body = &bytes[open + 1..bytes.len() - 1];
         let body_start = start + open + 1;
 
-        if framed.specifier.data_type != Some(DataType::Enumeration)
+        if framed.specifier.type_indicator != Some(DataType::Enumeration)
             && let Some(colon) = body.iter().position(|b| *b == b':')
         {
             let bound = |part: &[u8], offset| {
