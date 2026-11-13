@@ -10,7 +10,9 @@ use thiserror::Error;
 
 /// Borrowed ADI sections, their parser, and structural diagnostics.
 pub mod adi;
+mod number;
 mod parser;
+mod text;
 
 /// Explicit text encoding and declared-length interpretation for one parser.
 ///

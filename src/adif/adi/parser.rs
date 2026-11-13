@@ -13,9 +13,10 @@ use winnow::{
 use super::AdiFile;
 use crate::adif::{
     DataSpecifier, DataType, DecodeError, Field, LengthUnit, ParseEncoding, ParseOpts,
-    adi::{Header, Record, Section, parser::error::AdiError},
+    adi::{Header, HeaderEntry, Record, Section, parser::error::AdiError},
 };
 
+mod declarations;
 pub(super) mod error;
 #[cfg(test)]
 mod tests;
@@ -197,7 +198,7 @@ fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
                 .context(StrContext::Expected(
                     StrContextValue::StringLiteral("<EOH>"),
                 )),
-            |input: &mut Stream<'a>| unique_field(input, &mut seen),
+            |input: &mut Stream<'a>| unique_header_entry(input, &mut seen),
         ), take_till(0.., b'<')), eoh)
             .context(StrContext::Label("header field")),
         _: take_till(0.., b'<'),
@@ -209,7 +210,7 @@ fn header<'a>(input: &mut Stream<'a>) -> Result<Header<'a>> {
         text_bytes,
         text_span,
         text,
-        fields,
+        entries: fields,
     })
 }
 
@@ -226,10 +227,68 @@ fn eoh<'a>(input: &mut Stream<'a>) -> Result<Range<usize>> {
         .parse_next(input)
 }
 
+struct FramedField<'a> {
+    specifier: DataSpecifier<'a>,
+    raw_data: &'a [u8],
+    descriptor_span: Range<usize>,
+    value_span: Range<usize>,
+    text: Cow<'a, str>,
+}
+
 fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
+    let f = framed_field(input)?;
+
+    Ok(Field {
+        specifier: f.specifier,
+        raw_data: f.raw_data,
+        descriptor_span: f.descriptor_span,
+        value_span: f.value_span,
+        text: f.text,
+    })
+}
+
+fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
+    let f = framed_field(input)?;
+
+    if declarations::is_declaration(&f.specifier.name) {
+        declarations::parse(input, f).map(HeaderEntry::UserDefinition)
+    } else {
+        Ok(HeaderEntry::Field(Field {
+            specifier: f.specifier,
+            raw_data: f.raw_data,
+            descriptor_span: f.descriptor_span,
+            value_span: f.value_span,
+            text: f.text,
+        }))
+    }
+}
+
+fn unique_header_entry<'a>(
+    input: &mut Stream<'a>,
+    seen: &mut HashMap<String, Range<usize>>,
+) -> Result<HeaderEntry<'a>> {
+    let checkpoint = input.checkpoint();
+    let entry = header_entry(input)?;
+    let key = entry.name().to_ascii_uppercase();
+
+    if let Some(first) = seen.get(&key) {
+        let cause = AdiError::DuplicateField {
+            field_name: entry.name().to_owned(),
+            first_span: first.clone(),
+            second_span: entry.descriptor_span(),
+        };
+        input.reset(&checkpoint);
+        return Err(ContextError::from_external_error(input, cause));
+    }
+
+    seen.insert(key, entry.descriptor_span());
+    Ok(entry)
+}
+
+fn framed_field<'a>(input: &mut Stream<'a>) -> Result<FramedField<'a>> {
     let (specifier, descriptor_span) = data_specifier.with_span().parse_next(input)?;
     if specifier.length == 0 {
-        return Ok(Field {
+        return Ok(FramedField {
             specifier,
             descriptor_span,
             raw_data: &[],
@@ -316,7 +375,7 @@ fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
 
     let text = decode_located(input, raw_data, parse_opts.encoding, value_span.start)?;
 
-    Ok(Field {
+    Ok(FramedField {
         specifier,
         descriptor_span,
         raw_data,
@@ -395,7 +454,18 @@ fn data_type<'a>(input: &mut Stream<'a>) -> Result<DataType> {
 
 fn optional_data_type<'a>(input: &mut Stream<'a>) -> Result<Option<DataType>> {
     if opt(':').parse_next(input)?.is_some() {
-        data_type.parse_next(input).map(Some)
+        let start = input.current_token_start();
+        let kind = data_type.parse_next(input)?;
+        if matches!(kind, DataType::IntlString | DataType::IntlMultilineString) {
+            return Err(ContextError::from_external_error(
+                input,
+                AdiError::TypeUnavailableInAdi {
+                    data_type: kind,
+                    span: start..input.current_token_start(),
+                },
+            ));
+        }
+        Ok(Some(kind))
     } else {
         Ok(None)
     }
@@ -517,71 +587,28 @@ mod test {
         let parsed = header(&mut header_text)
             .expect("header example should parse because its fields are framed and EOH is present");
 
+        assert_eq!(parsed.span(), 0..180);
+        assert_eq!(parsed.text_span(), 0..49);
         assert_eq!(
-            Header {
-                text_bytes: "Generated on 2011-11-22 at 02:15:23Z for WN4AZY\n\n".as_bytes(),
-                span: 0..180,
-                text_span: 0..49,
-                text: "Generated on 2011-11-22 at 02:15:23Z for WN4AZY\n\n".into(),
-                fields: vec![
-                    Field {
-                        specifier: DataSpecifier {
-                            name: Cow::Owned("adif_ver".to_owned()),
-                            length: 5,
-                            data_type: None
-                        },
-                        raw_data: "3.0.5".as_bytes(),
-                        descriptor_span: 49..61,
-                        value_span: 61..66,
-                        text: Cow::Owned("3.0.5".to_owned()),
-                    },
-                    Field {
-                        specifier: DataSpecifier {
-                            name: Cow::Owned("programid".to_owned()),
-                            length: 7,
-                            data_type: None
-                        },
-                        raw_data: "MonoLog".as_bytes(),
-                        descriptor_span: 67..80,
-                        value_span: 80..87,
-                        text: Cow::Owned("MonoLog".to_owned()),
-                    },
-                    Field {
-                        specifier: DataSpecifier {
-                            name: Cow::Owned("USERDEF1".to_owned()),
-                            length: 8,
-                            data_type: Some(DataType::Number)
-                        },
-                        raw_data: "QRP_ARCI".as_bytes(),
-                        descriptor_span: 88..102,
-                        value_span: 102..110,
-                        text: Cow::Owned("QRP_ARCI".to_owned()),
-                    },
-                    Field {
-                        specifier: DataSpecifier {
-                            name: Cow::Owned("USERDEF2".to_owned()),
-                            length: 19,
-                            data_type: Some(DataType::Enumeration)
-                        },
-                        raw_data: "SweaterSize,{S,M,L}".as_bytes(),
-                        descriptor_span: 111..126,
-                        value_span: 126..145,
-                        text: Cow::Owned("SweaterSize,{S,M,L}".to_owned()),
-                    },
-                    Field {
-                        specifier: DataSpecifier {
-                            name: Cow::Owned("USERDEF3".to_owned()),
-                            length: 15,
-                            data_type: None
-                        },
-                        raw_data: "ShoeSize,{5:20}".as_bytes(),
-                        descriptor_span: 146..159,
-                        value_span: 159..174,
-                        text: Cow::Owned("ShoeSize,{5:20}".to_owned()),
-                    }
-                ],
-            },
-            parsed,
-        )
+            parsed.text(),
+            "Generated on 2011-11-22 at 02:15:23Z for WN4AZY\n\n"
+        );
+        for (entry, (name, descriptor, value, text)) in parsed.entries().iter().zip([
+            ("adif_ver", 49..61, 61..66, "3.0.5"),
+            ("programid", 67..80, 80..87, "MonoLog"),
+            ("USERDEF1", 88..102, 102..110, "QRP_ARCI"),
+            ("USERDEF2", 111..126, 126..145, "SweaterSize,{S,M,L}"),
+            ("USERDEF3", 146..159, 159..174, "ShoeSize,{5:20}"),
+        ]) {
+            assert_eq!(entry.name(), name);
+            assert_eq!(entry.descriptor_span(), descriptor);
+            assert_eq!(entry.value_span(), value);
+            let actual = match entry {
+                HeaderEntry::Field(f) => f.text(),
+                HeaderEntry::UserDefinition(d) => d.text(),
+            };
+            assert_eq!(actual, text);
+        }
+        assert_eq!(parsed.entries().len(), 5);
     }
 }

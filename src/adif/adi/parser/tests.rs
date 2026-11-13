@@ -7,6 +7,7 @@
 use super::error::StructuralError;
 use super::*;
 
+mod declarations;
 mod decoding;
 
 #[track_caller]
@@ -172,7 +173,7 @@ fn descriptors_preserve_names_and_accept_zero_and_leading_zero_lengths() {
 
 #[test]
 fn all_defined_type_indicators_are_case_insensitive() {
-    // I/G are defined indicators; their ADI eligibility is a validation concern.
+    // Known ADX-only indicators are recognized separately from ADI eligibility.
     for (indicator, expected) in [
         ('B', DataType::Boolean),
         ('N', DataType::Number),
@@ -188,7 +189,22 @@ fn all_defined_type_indicators_are_case_insensitive() {
         for supplied in [indicator, indicator.to_ascii_lowercase()] {
             let bytes = format!("<APP_TEST_VALUE:0:{supplied}><EOR>");
             let mut input = ascii_stream(bytes.as_bytes());
-            let parsed = field(&mut input).unwrap();
+            if matches!(
+                expected,
+                DataType::IntlString | DataType::IntlMultilineString
+            ) {
+                assert_eq!(
+                    data_type(&mut ascii_stream(supplied.to_string().as_bytes())).unwrap_or_else(
+                        |error| panic!("expected indicator {supplied:?} to parse: {error:?}")
+                    ),
+                    expected
+                );
+                field(&mut input).expect_err(&format!(
+                    "indicator {supplied} should fail because it is reserved for ADX; input {bytes:?}"
+                ));
+                continue;
+            }
+            let parsed = parse_ok(field, &mut input);
             assert_eq!(parsed.specifier.data_type, Some(expected), "{supplied}");
             assert_eq!(parsed.raw_data, b"");
             assert_eq!(*input.input.as_ref(), b"<EOR>");
@@ -313,7 +329,7 @@ fn files_detect_headers_from_the_first_byte_and_preserve_preambles() {
                     "expected preamble should be present because header presence was checked above"
                 )
             );
-            assert!(header.fields.is_empty());
+            assert!(header.entries().is_empty());
         }
         assert_eq!(file.records.len(), 1);
         assert_eq!(named(&file.records[0], "NAME").text(), "Ray");
@@ -913,7 +929,14 @@ fn upstream_difa_fixture_has_three_records_with_distinct_times() {
         ParseEncoding::Ascii,
         LengthUnit::Bytes,
     );
-    assert_eq!(file.header.unwrap().fields[0].text(), "3.1.4");
+    assert_eq!(
+        file.header
+            .expect("input should yield a header because it starts with a preamble")
+            .field("ADIF_VER")
+            .expect("header should contain ADIF_VER from the fixture descriptor")
+            .text(),
+        "3.1.4"
+    );
     assert_eq!(file.records.len(), 3);
     for (record, call, time) in [
         (&file.records[0], "W1AW", "1430"),

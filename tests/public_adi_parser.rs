@@ -50,6 +50,16 @@ fn named<'r, 'a>(
         .unwrap_or_else(|| panic!("expected field {name:?}, got {record:?}"))
 }
 
+#[track_caller]
+fn definition<'r, 'a>(
+    entry: &'r qso_io::adif::adi::HeaderEntry<'a>,
+) -> &'r qso_io::adif::adi::UserDefinition<'a> {
+    match entry {
+        qso_io::adif::adi::HeaderEntry::UserDefinition(definition) => definition,
+        other => panic!("expected USERDEF declaration, got {other:?}"),
+    }
+}
+
 #[test]
 fn options_and_read_only_values_are_usable_by_a_consumer() {
     for (encoding, field_length, bytes, value) in [
@@ -137,21 +147,29 @@ fn sections_have_syntactic_spans_and_can_outlive_the_parser() {
     let bytes = b"P<PROGRAMID:0><EOH>\r\n<NAME:1>A<EOR>\nignore<NAME:0><EOR>\r\n";
     let sections: Vec<_> = Parser::new(bytes, ParseOpts::default())
         .collect::<Result<_, _>>()
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!("input {bytes:?}: expected complete sections, got {error:?}")
+        });
     assert_eq!(sections.len(), 3);
     let Section::Header(header) = &sections[0] else {
-        panic!("missing header");
+        panic!("expected Section::Header(header), got {:?}", sections[0]);
     };
     assert_eq!(header.span(), 0..19);
     assert_eq!(header.text_span(), 0..1);
     assert_eq!(header.raw_text(), b"P");
     assert_eq!(header.text(), "P");
-    assert_eq!(header.fields().len(), 1);
-    assert_eq!(header.field("programid").unwrap().value_span(), 14..14);
+    assert_eq!(header.entries().len(), 1);
+    assert_eq!(
+        header
+            .field("programid")
+            .expect("header should contain PROGRAMID from the supplied descriptor")
+            .value_span(),
+        14..14
+    );
     for (section, expected) in sections.into_iter().skip(1).zip([21..35, 42..55]) {
         let record = record(section);
         assert_eq!(record.span(), expected);
-        let field = record.field("name").unwrap();
+        let field = named(&record, "name");
         assert_eq!(&bytes[field.value_span()], field.raw_data());
         assert!(field.descriptor_span().end <= field.value_span().start);
     }
@@ -337,4 +355,56 @@ fn public_syntax_errors_distinguish_missing_ends_and_bad_descriptors() {
         );
         assert_exhausted(&mut parser);
     }
+}
+
+#[test]
+fn headers_distinguish_definitions_from_fields() {
+    let bytes = b"P<PROGRAMID:1>A<USERDEF1:3:N>EPC<COMMENT:1>B<USERDEF2:19:E>SweaterSize,{S,M,L}<USERDEF3:15>ShoeSize,{5:20}<EOH><EPC:3>123<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let header = match next_section(&mut parser) {
+        Section::Header(header) => header,
+        other => panic!("expected header, got {other:?}"),
+    };
+    assert_eq!(header.entries().len(), 5);
+    let epc = definition(&header.entries()[1]);
+    assert_eq!(epc.field_name(), "EPC");
+    assert_eq!(epc.data_type(), Some(qso_io::adif::DataType::Number));
+    assert_eq!(epc.text(), "EPC");
+    assert_eq!(epc.constraint(), None, "declaration {epc:?}");
+    assert!(
+        header.field("USERDEF1").is_none(),
+        "expected a declaration rather than an ordinary field, got {:?}",
+        header.field("USERDEF1")
+    );
+    assert!(
+        header.entry("userdef1").is_some(),
+        "expected USERDEF1 entry, got {header:?}"
+    );
+    let sizes = definition(&header.entries()[3]);
+    assert_eq!(
+        sizes.constraint(),
+        Some(&qso_io::adif::adi::UserDefinitionConstraint::Enumeration(
+            ["S", "M", "L"].map(str::to_owned).to_vec()
+        ))
+    );
+    let range = definition(&header.entries()[4]);
+    assert_eq!(range.data_type(), None);
+    assert!(
+        matches!(range.constraint(), Some(qso_io::adif::adi::UserDefinitionConstraint::Range {lower,upper}) if lower == &bigdecimal::BigDecimal::from(5) && upper == &bigdecimal::BigDecimal::from(20)),
+        "unexpected value: {:?}",
+        range.constraint()
+    );
+    for entry in header.entries() {
+        if let qso_io::adif::adi::HeaderEntry::UserDefinition(def) = entry {
+            assert_eq!(&bytes[def.value_span()], def.raw_data());
+            assert!(bytes[def.descriptor_span()].starts_with(b"<USERDEF"));
+        }
+    }
+    assert_eq!(
+        record(next_section(&mut parser))
+            .field("EPC")
+            .expect("record should contain EPC from the supplied <EPC:3>123 field")
+            .text(),
+        "123"
+    );
 }

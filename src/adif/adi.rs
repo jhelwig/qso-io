@@ -8,9 +8,11 @@ use std::{borrow::Cow, ops::Range};
 
 use crate::adif::Field;
 
+pub use header::{HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError};
 pub use parser::Parser;
 pub use parser::error::{StructuralError, StructuralErrorKind, SyntaxErrorKind};
 
+mod header;
 mod parser;
 
 /// A complete header or record from an ADI input.
@@ -44,22 +46,28 @@ pub struct Header<'a> {
     text_bytes: &'a [u8],
     text_span: Range<usize>,
     text: Cow<'a, str>,
-    fields: Vec<Field<'a>>,
+    entries: Vec<HeaderEntry<'a>>,
 }
 
 impl<'a> Header<'a> {
-    /// Borrows all fields in their original order.
-    pub fn fields(&self) -> &[Field<'a>] {
-        &self.fields
+    /// Borrows header fields and declarations in their original order.
+    pub fn entries(&self) -> &[HeaderEntry<'a>] {
+        &self.entries
     }
 
-    /// Finds a field by ASCII case-insensitive name, or returns `None`.
-    ///
-    /// The returned field retains its original name casing.
-    pub fn field(&self, name: &str) -> Option<&Field<'a>> {
-        self.fields
+    /// Finds an entry by its ASCII case-insensitive descriptor name.
+    pub fn entry(&self, name: &str) -> Option<&HeaderEntry<'a>> {
+        self.entries
             .iter()
-            .find(|f| f.name().eq_ignore_ascii_case(name))
+            .find(|e| e.name().eq_ignore_ascii_case(name))
+    }
+
+    /// Finds an ordinary field; USERDEFn declarations are exposed through entries.
+    pub fn field(&self, name: &str) -> Option<&Field<'a>> {
+        match self.entry(name)? {
+            HeaderEntry::Field(f) => Some(f),
+            _ => None,
+        }
     }
 
     /// Borrows the original preamble bytes, including line endings and blanks.
