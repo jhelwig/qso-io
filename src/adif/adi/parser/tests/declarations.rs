@@ -48,7 +48,7 @@ fn declaration_constraints_use_the_agreed_precedence() {
             other => panic!("{other:?}"),
         }
     }
-    let bytes = document("USERDEF1", Some('E'), b"X,{A:B,C,,}");
+    let bytes = document("USERDEF1", Some('E'), b"X,{A:B,C}");
     let h = parse_file(&bytes, ParseEncoding::Ascii, LengthUnit::Bytes)
         .header
         .expect("input should yield a header because it starts with a preamble");
@@ -56,7 +56,7 @@ fn declaration_constraints_use_the_agreed_precedence() {
     assert_eq!(
         def.constraint(),
         Some(&UserDefinitionConstraint::Enumeration(
-            ["A:B", "C", "", ""].map(str::to_owned).to_vec()
+            ["A:B", "C"].map(str::to_owned).to_vec()
         ))
     );
 }
@@ -201,7 +201,7 @@ fn adx_only_indicators_are_terminal_even_on_empty_fields() {
 
 #[test]
 fn declaration_uniqueness_uses_original_descriptor_names() {
-    let bytes = b"P<USERDEF1:1:N>X<USERDEF01:1:N>X<EOH>";
+    let bytes = b"P<USERDEF1:1:N>X<USERDEF01:1:N>Y<EOH>";
     let header = parse_file(bytes, ParseEncoding::Ascii, LengthUnit::Bytes)
         .header
         .expect("input should yield a header because it starts with a preamble");
@@ -219,4 +219,240 @@ fn declaration_uniqueness_uses_original_descriptor_names() {
     };
     assert_eq!(&bytes[first_span.clone()], b"<USERDEF1:1:N>");
     assert_eq!(&bytes[second_span.clone()], b"<userdef1:1:N>");
+}
+
+#[test]
+fn userdef_enumeration_members_are_nonempty() {
+    for payload in [b"X,{}".as_slice(), b"X,{,A}", b"X,{A,}", b"X,{A,,B}"] {
+        let bytes = document("USERDEF1", Some('E'), payload);
+        let mut parser = Parser::new(&bytes, ParseOpts::default());
+        let error = next_error(&mut parser);
+        assert!(
+            matches!(
+                error.kind(),
+                error::StructuralErrorKind::InvalidUserDefinition {
+                    cause: crate::adif::adi::UserDefinitionError::InvalidEnumeration,
+                    ..
+                }
+            ),
+            "{payload:?}: {error:?}"
+        );
+        assert!(
+            error.span().is_empty(),
+            "missing member should point between delimiters: {error:?}"
+        );
+        assert_exhausted(&mut parser);
+    }
+    let bytes = document("USERDEF1", Some('E'), b"X,{ }");
+    parse_file(&bytes, ParseEncoding::Ascii, LengthUnit::Bytes);
+}
+
+#[test]
+fn userdef_collisions_fail_when_the_declaration_is_added() {
+    let bytes = b"P<USERDEF1:5:N>SCORE<USERDEF2:5:N>score<BROKEN";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let error = next_error(&mut parser);
+    let error::StructuralErrorKind::DuplicateUserDefinition {
+        first_span,
+        second_span,
+        ..
+    } = error.kind()
+    else {
+        panic!("expected duplicate target before BROKEN, got {error:?}");
+    };
+    assert_eq!(&bytes[first_span.clone()], b"SCORE");
+    assert_eq!(&bytes[second_span.clone()], b"score");
+    assert_eq!(error.span(), *second_span);
+    assert_exhausted(&mut parser);
+
+    let bytes = b"P<USERDEF1:4:N>FREQ<EOH>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(
+            error.kind(),
+            error::StructuralErrorKind::InvalidUserDefinition {
+                cause: crate::adif::adi::UserDefinitionError::StandardFieldName,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(&bytes[error.span()], b"FREQ");
+}
+
+#[test]
+fn userdef_types_and_ranges_survive_dropping_the_header() {
+    let bytes = b"P<USERDEF1:5:N>SCORE<USERDEF2:11>SIZE,{5:20}<EOH><SCORE:3>123<SIZE:1>5<EOR><SIZE:2>20<EOR><SIZE:2>21<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    drop(next_section(&mut parser));
+    let section = next_section(&mut parser);
+    let Section::Record(record) = section else {
+        panic!("expected first record, got {section:?}");
+    };
+    assert_eq!(named(&record, "SCORE").data_type(), Some(DataType::Number));
+    assert!(
+        matches!(named(&record, "SCORE").value(), Some(crate::adif::Value::Number(n)) if n.to_string()=="123")
+    );
+    assert_eq!(named(&record, "SIZE").data_type(), None);
+    assert!(matches!(named(&record, "SIZE").value(), Some(crate::adif::Value::Text(t)) if t=="5"));
+    let _ = next_section(&mut parser);
+    let error = next_error(&mut parser);
+    let error::StructuralErrorKind::UserDefinitionConstraintViolation {
+        constraint_span,
+        cause: crate::adif::adi::UserDefinitionValueError::OutOfRange { lower, upper },
+        ..
+    } = error.kind()
+    else {
+        panic!("expected range violation, got {error:?}");
+    };
+    assert_eq!(&bytes[error.span()], b"21");
+    assert_eq!(&bytes[constraint_span.clone()], b"{5:20}");
+    assert_eq!(lower, &bigdecimal::BigDecimal::from(5));
+    assert_eq!(upper, &bigdecimal::BigDecimal::from(20));
+    assert_exhausted(&mut parser);
+}
+
+#[test]
+fn userdef_empty_fields_skip_constraints_but_not_descriptors() {
+    let bytes = b"P<USERDEF1:12:N>SCORE,{5:20}<EOH><SCORE:0><EOR><SCORE:0:S><EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let _ = next_section(&mut parser);
+    let section = next_section(&mut parser);
+    let Section::Record(record) = section else {
+        panic!("expected empty-value record, got {section:?}");
+    };
+    assert!(named(&record, "SCORE").value().is_none());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(
+            error.kind(),
+            error::StructuralErrorKind::TypeConflict {
+                definition_span: Some(_),
+                supplied: DataType::String,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn userdef_unicode_membership_preserves_source_locations() {
+    for (encoding, unit) in [
+        (ParseEncoding::Utf8, LengthUnit::Bytes),
+        (ParseEncoding::Utf8, LengthUnit::UnicodeScalars),
+        (ParseEncoding::Latin1, LengthUnit::Bytes),
+        (ParseEncoding::Latin1, LengthUnit::UnicodeScalars),
+    ] {
+        for (member, value, accepted) in [
+            ("Café", "CAFÉ", true),
+            ("Straße", "STRASSE", true),
+            ("Café", "Cafe\u{301}", false),
+            ("S", " S", false),
+            ("S", "S ", false),
+        ] {
+            if encoding == ParseEncoding::Latin1 && !value.chars().all(|c| u32::from(c) <= 255) {
+                continue;
+            }
+            let encode = |s: &str| -> Vec<u8> {
+                if encoding == ParseEncoding::Latin1 {
+                    s.chars().map(|c| c as u8).collect()
+                } else {
+                    s.as_bytes().to_vec()
+                }
+            };
+            let length = |s: &str| {
+                if unit == LengthUnit::UnicodeScalars {
+                    s.chars().count()
+                } else {
+                    encode(s).len()
+                }
+            };
+            let payload = format!("X,{{{member}}}");
+            let mut bytes = format!("P<USERDEF1:{}:E>", length(&payload)).into_bytes();
+            bytes.extend(encode(&payload));
+            bytes.extend(b"<EOH>");
+            bytes.extend(format!("<X:{}>", length(value)).as_bytes());
+            let start = bytes.len();
+            bytes.extend(encode(value));
+            let end = bytes.len();
+            bytes.extend(b"<EOR>");
+            let mut parser = Parser::new(
+                &bytes,
+                ParseOpts {
+                    encoding,
+                    field_length: unit,
+                },
+            );
+            let _ = next_section(&mut parser);
+            if accepted {
+                let section = next_section(&mut parser);
+                let Section::Record(record) = section else {
+                    panic!("expected record, got {section:?}");
+                };
+                assert_eq!(named(&record, "X").text(), value);
+            } else {
+                let error = next_error(&mut parser);
+                assert_eq!(error.span(), start..end, "{member:?} {value:?}: {error:?}");
+                let error::StructuralErrorKind::UserDefinitionConstraintViolation {
+                    constraint_span,
+                    ..
+                } = error.kind()
+                else {
+                    panic!("expected constraint failure, got {error:?}");
+                };
+                assert_eq!(
+                    &bytes[constraint_span.clone()],
+                    encode(&format!("{{{member}}}"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn userdef_precedence_keeps_untyped_application_shaped_fields_untyped() {
+    let bytes=b"P<USERDEF1:24>APP_EXAMPLE_SCORE,{5:20}<EOH><APP_EXAMPLE_SCORE:1>5<EOR><APP_EXAMPLE_SCORE:1:N>6<EOR><APP_EXAMPLE_SCORE:1>7<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let _ = next_section(&mut parser);
+    for kind in [None, Some(DataType::Number), None] {
+        let section = next_section(&mut parser);
+        let Section::Record(record) = section else {
+            panic!("expected record, got {section:?}");
+        };
+        assert_eq!(named(&record, "APP_EXAMPLE_SCORE").data_type(), kind);
+    }
+}
+
+#[test]
+fn userdef_constraints_compare_original_spelling_and_check_nonempty_whitespace() {
+    for (bytes, expected) in [
+        (b"P<USERDEF1:7:N>X,{1,2}<EOH><X:2>01<EOR>".as_slice(), "01"),
+        (b"P<USERDEF1:8>X,{5:20}<EOH><X:1> <EOR>".as_slice(), " "),
+        (
+            b"P<USERDEF1:5:E>X,{A}<EOH><X:0><EOR><X:1> <EOR>".as_slice(),
+            " ",
+        ),
+    ] {
+        let mut parser = Parser::new(bytes, ParseOpts::default());
+        let _ = next_section(&mut parser);
+        if bytes.windows(5).any(|w| w == b"<X:0>") {
+            let section = next_section(&mut parser);
+            let Section::Record(record) = section else {
+                panic!("expected empty field record, got {section:?}");
+            };
+            assert!(named(&record, "X").value().is_none());
+        }
+        let error = next_error(&mut parser);
+        assert!(
+            matches!(
+                error.kind(),
+                error::StructuralErrorKind::UserDefinitionConstraintViolation { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(&bytes[error.span()], expected.as_bytes());
+        assert_exhausted(&mut parser);
+    }
 }

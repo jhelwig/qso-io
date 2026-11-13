@@ -703,10 +703,12 @@ fn composite_values_and_definitions_outlive_the_parser() {
     assert_eq!(t.precision(), TimePrecision::Second);
     assert_eq!(t.time().to_string(), "13:05:00");
     assert!(
-        matches!(named(second, "EPC").value(),Some(Value::Text(s)) if s=="123"),
+        matches!(named(second, "EPC").value(),Some(Value::Number(n)) if n == &bigdecimal::BigDecimal::from(123)),
         "unexpected value: {:?}",
         named(second, "EPC").value()
     );
+    assert_eq!(named(second, "EPC").text(), "123");
+    assert_eq!(named(second, "EPC").type_indicator(), None);
 }
 
 #[test]

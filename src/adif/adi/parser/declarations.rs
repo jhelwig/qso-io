@@ -110,6 +110,12 @@ pub(super) fn parse<'a>(input: &Stream<'a>, framed: FramedField<'a>) -> Result<U
             let mut offset = body_start;
 
             for part in body.split(|b| *b == b',') {
+                if part.is_empty() {
+                    return Err(failure(
+                        UserDefinitionError::InvalidEnumeration,
+                        offset..offset,
+                    ));
+                }
                 if let Err(span) = check_text(part, input.state.parser_options.encoding, false) {
                     return Err(failure(
                         UserDefinitionError::InvalidEnumeration,
@@ -131,6 +137,8 @@ pub(super) fn parse<'a>(input: &Stream<'a>, framed: FramedField<'a>) -> Result<U
     };
 
     Ok(UserDefinition {
+        target_span: start..start + name_end,
+        constraint_span: comma.map(|offset| start + offset + 1..framed.value_span.end),
         specifier: framed.specifier,
         number,
         field_name,

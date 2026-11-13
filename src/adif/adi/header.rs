@@ -47,6 +47,8 @@ pub struct UserDefinition<'a> {
     pub(super) number: BigUint,
     pub(super) field_name: String,
     pub(super) constraint: Option<UserDefinitionConstraint>,
+    pub(super) target_span: Range<usize>,
+    pub(super) constraint_span: Option<Range<usize>>,
     pub(super) raw_data: &'a [u8],
     pub(super) text: Cow<'a, str>,
     pub(super) descriptor_span: Range<usize>,
@@ -105,10 +107,10 @@ impl<'a> UserDefinition<'a> {
     }
 }
 
-/// An optional enumeration or exact numeric range declared by USERDEFn.
+/// An enumeration or exact numeric range declared by USERDEFn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserDefinitionConstraint {
-    /// String members in supplied order, preserving spelling and empty members.
+    /// String members in supplied order, preserving spelling; members must be nonempty.
     Enumeration(Vec<String>),
     /// A range whose upper bound is strictly greater than its lower bound.
     Range {
@@ -125,6 +127,9 @@ pub enum UserDefinitionError {
     /// The declaration number is not positive.
     #[error("invalid declaration number")]
     InvalidDeclarationNumber,
+    /// The target is a standard ADIF field name.
+    #[error("user-defined target is a standard ADIF field name")]
+    StandardFieldName,
     /// Declaration delimiters or its constraint envelope are malformed.
     #[error("malformed declaration")]
     MalformedDeclaration,
@@ -137,4 +142,26 @@ pub enum UserDefinitionError {
     /// The upper bound is equal to or smaller than the lower bound.
     #[error("upper range bound must exceed lower bound")]
     InvalidRangeOrder,
+}
+
+/// A supplied nonempty value fails its document USERDEF constraint.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum UserDefinitionValueError {
+    /// Contents required for a range are not an ADIF Number.
+    #[error("range value is not an ADIF Number: {cause}")]
+    InvalidRangeValue {
+        /// Type-specific numeric grammar reason.
+        cause: crate::adif::ValueError,
+    },
+    /// A Number falls outside the declaration's inclusive bounds.
+    #[error("value is outside inclusive range {lower} through {upper}")]
+    OutOfRange {
+        /// Exact inclusive lower bound.
+        lower: BigDecimal,
+        /// Exact inclusive upper bound.
+        upper: BigDecimal,
+    },
+    /// The original spelling matches no member under default Unicode folding.
+    #[error("value is not a member of the declared enumeration")]
+    NotInEnumeration,
 }

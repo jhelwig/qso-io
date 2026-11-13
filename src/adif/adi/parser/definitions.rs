@@ -19,6 +19,7 @@ pub(super) enum TypeSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DefinitionSource {
     Standard,
+    UserDefinition,
     Application,
     InlineOrUnknown,
 }
@@ -39,14 +40,23 @@ pub(super) fn is_application(name: &str) -> bool {
 }
 
 pub(super) fn resolve(
-    _state: &State,
+    state: &State,
     section: FieldSection,
     specifier: &DataSpecifier<'_>,
     descriptor_span: Range<usize>,
 ) -> Result<ResolvedDefinition, AdiError> {
     let standard = catalog::lookup(section, &specifier.name);
+    let user = if section == FieldSection::Record {
+        state
+            .user_definitions
+            .get(&specifier.name.to_ascii_uppercase())
+    } else {
+        None
+    };
     let source = if standard.is_some() {
         DefinitionSource::Standard
+    } else if user.is_some() {
+        DefinitionSource::UserDefinition
     } else if section == FieldSection::Record && is_application(&specifier.name) {
         DefinitionSource::Application
     } else {
@@ -57,19 +67,42 @@ pub(super) fn resolve(
             && !definition.data_types().contains(&supplied)
         {
             return Err(AdiError::Defined {
+                numeric_cause: None,
                 span: descriptor_span,
-                kind: StructuralErrorKind::TypeConflict {
+                kind: Box::new(StructuralErrorKind::TypeConflict {
                     field_name: specifier.name.to_string(),
                     expected: definition.data_types().to_vec(),
                     supplied,
                     definition_span: None,
-                },
+                }),
             });
         }
         if let [only] = definition.data_types() {
             TypeSelection::Single(*only)
         } else {
             TypeSelection::Alternatives(definition.data_types())
+        }
+    } else if let Some(rule) = user {
+        if let Some(expected) = rule.data_type {
+            if let Some(supplied) = specifier.type_indicator
+                && supplied != expected
+            {
+                return Err(AdiError::Defined {
+                    numeric_cause: None,
+                    span: descriptor_span,
+                    kind: Box::new(StructuralErrorKind::TypeConflict {
+                        field_name: specifier.name.to_string(),
+                        expected: vec![expected],
+                        supplied,
+                        definition_span: Some(rule.declaration_span.clone()),
+                    }),
+                });
+            }
+            TypeSelection::Single(expected)
+        } else {
+            specifier
+                .type_indicator
+                .map_or(TypeSelection::Untyped, TypeSelection::Single)
         }
     } else if source == DefinitionSource::Application {
         TypeSelection::Single(
@@ -168,11 +201,124 @@ pub(super) fn parse_resolved<'a>(
     Err(ContextError::from_external_error(
         input,
         AdiError::Defined {
+            numeric_cause: None,
             span,
-            kind: StructuralErrorKind::NoMatchingType {
+            kind: Box::new(StructuralErrorKind::NoMatchingType {
                 field_name: framed.specifier.name.to_string(),
                 failures,
-            },
+            }),
         },
     ))
+}
+
+#[derive(Debug)]
+pub(super) struct UserFieldRule {
+    data_type: Option<DataType>,
+    constraint: Option<(crate::adif::adi::UserDefinitionConstraint, Range<usize>)>,
+    declaration_span: Range<usize>,
+    target_span: Range<usize>,
+}
+
+pub(super) fn register_user_definition(
+    state: &mut State,
+    definition: &crate::adif::adi::UserDefinition<'_>,
+) -> Result<(), AdiError> {
+    let target = definition.field_name();
+    if catalog::is_standard_name(target) {
+        return Err(AdiError::InvalidUserDefinition {
+            field_name: definition.name().to_owned(),
+            span: definition.target_span.clone(),
+            cause: crate::adif::adi::UserDefinitionError::StandardFieldName,
+            numeric_cause: None,
+        });
+    }
+    let key = target.to_ascii_uppercase();
+    if let Some(first) = state.user_definitions.get(&key) {
+        return Err(AdiError::Defined {
+            span: definition.target_span.clone(),
+            numeric_cause: None,
+            kind: Box::new(StructuralErrorKind::DuplicateUserDefinition {
+                field_name: target.to_owned(),
+                first_span: first.target_span.clone(),
+                second_span: definition.target_span.clone(),
+            }),
+        });
+    }
+    state.user_definitions.insert(
+        key,
+        UserFieldRule {
+            data_type: definition.data_type(),
+            constraint: definition
+                .constraint()
+                .cloned()
+                .zip(definition.constraint_span.clone()),
+            declaration_span: definition.descriptor_span(),
+            target_span: definition.target_span.clone(),
+        },
+    );
+    Ok(())
+}
+
+pub(super) fn check_user_constraints(state: &State, field: &Field<'_>) -> Result<(), AdiError> {
+    use crate::adif::adi::{UserDefinitionConstraint, UserDefinitionValueError};
+
+    if field.value().is_none() {
+        return Ok(());
+    }
+    let Some(rule) = state
+        .user_definitions
+        .get(&field.name().to_ascii_uppercase())
+    else {
+        return Ok(());
+    };
+    let Some((constraint, constraint_span)) = &rule.constraint else {
+        return Ok(());
+    };
+    let fail = |cause, span, numeric_cause| AdiError::Defined {
+        span,
+        numeric_cause,
+        kind: Box::new(StructuralErrorKind::UserDefinitionConstraintViolation {
+            field_name: field.name().to_owned(),
+            declaration_span: rule.declaration_span.clone(),
+            constraint_span: constraint_span.clone(),
+            cause,
+        }),
+    };
+    match constraint {
+        UserDefinitionConstraint::Enumeration(members) => {
+            if !members
+                .iter()
+                .any(|member| caseless::default_caseless_match_str(member, field.text()))
+            {
+                return Err(fail(
+                    UserDefinitionValueError::NotInEnumeration,
+                    field.value_span(),
+                    None,
+                ));
+            }
+        }
+        UserDefinitionConstraint::Range { lower, upper } => {
+            let value = crate::adif::number::parse_number(field.raw_data()).map_err(|error| {
+                let start = field.value_span().start;
+                fail(
+                    UserDefinitionValueError::InvalidRangeValue {
+                        cause: ValueError::InvalidNumber,
+                    },
+                    start + error.span.start..start + error.span.end,
+                    error.cause.map(Into::into),
+                )
+            })?;
+            if value < *lower || value > *upper {
+                return Err(fail(
+                    UserDefinitionValueError::OutOfRange {
+                        lower: lower.clone(),
+                        upper: upper.clone(),
+                    },
+                    field.value_span(),
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(())
 }

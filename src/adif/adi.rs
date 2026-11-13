@@ -8,7 +8,10 @@ use std::{borrow::Cow, ops::Range};
 
 use crate::adif::Field;
 
-pub use header::{HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError};
+pub use header::{
+    HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError,
+    UserDefinitionValueError,
+};
 pub use parser::Parser;
 pub use parser::error::{
     StructuralError, StructuralErrorKind, SyntaxErrorKind, TypeAlternativeFailure,

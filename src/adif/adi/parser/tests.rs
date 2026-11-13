@@ -62,6 +62,7 @@ fn stream(bytes: &[u8], encoding: ParseEncoding, field_length: LengthUnit) -> St
                 encoding,
                 field_length,
             },
+            ..State::default()
         },
     }
 }
