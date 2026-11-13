@@ -10,7 +10,9 @@ use crate::adif::Field;
 
 pub use header::{HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError};
 pub use parser::Parser;
-pub use parser::error::{StructuralError, StructuralErrorKind, SyntaxErrorKind};
+pub use parser::error::{
+    StructuralError, StructuralErrorKind, SyntaxErrorKind, TypeAlternativeFailure,
+};
 
 mod header;
 mod parser;

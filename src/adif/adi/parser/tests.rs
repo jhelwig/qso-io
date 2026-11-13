@@ -9,6 +9,7 @@ use super::*;
 
 mod declarations;
 mod decoding;
+mod definitions;
 mod lists;
 mod values;
 
@@ -300,9 +301,9 @@ fn zero_length_fields_leave_the_next_tag_untouched_in_every_mode() {
 #[test]
 fn value_lengths_protect_embedded_tags_punctuation_and_line_breaks() {
     for (bytes, expected) in [
-        (&b"<COMMENT:5><EOR><EOR>"[..], &b"<EOR>"[..]),
-        (&b"<COMMENT:5><EOH><EOR>"[..], &b"<EOH>"[..]),
-        (&b"<COMMENT:5>a:\r\nb<EOR>"[..], &b"a:\r\nb"[..]),
+        (&b"<UNKNOWN:5><EOR><EOR>"[..], &b"<EOR>"[..]),
+        (&b"<UNKNOWN:5><EOH><EOR>"[..], &b"<EOH>"[..]),
+        (&b"<UNKNOWN:5>a:\r\nb<EOR>"[..], &b"a:\r\nb"[..]),
     ] {
         let mut input = ascii_stream(bytes);
         let parsed = parse_ok(record, &mut input);
@@ -610,7 +611,7 @@ fn byte_lengths_splitting_a_utf8_scalar_fail_at_the_bounded_sequence() {
 #[test]
 fn latin1_decoding_keeps_c1_controls_instead_of_windows_1252_mapping() {
     let mut input = stream(
-        b"<NAME:3>\x80\xe9\xff<EOR>",
+        b"<TEST:3>\x80\xe9\xff<EOR>",
         ParseEncoding::Latin1,
         LengthUnit::Bytes,
     );
@@ -621,7 +622,7 @@ fn latin1_decoding_keeps_c1_controls_instead_of_windows_1252_mapping() {
 
 #[test]
 fn ascii_decoding_does_not_enforce_printable_field_value_rules() {
-    let mut input = ascii_stream(b"<COMMENT:4>\0\r\n\x7f<EOR>");
+    let mut input = ascii_stream(b"<UNKNOWN:4>\0\r\n\x7f<EOR>");
     let parsed = parse_ok(record, &mut input);
     assert_eq!(parsed.fields[0].text().as_bytes(), b"\0\r\n\x7f");
 }
@@ -932,29 +933,34 @@ fn upstream_matir_preamble_fixture_preserves_header_text() {
 }
 
 #[test]
-fn upstream_difa_fixture_has_three_records_with_distinct_times() {
-    let file = parse_file(
-        fixture!("difa/examples/sample.adif"),
-        ParseEncoding::Ascii,
-        LengthUnit::Bytes,
-    );
+fn upstream_difa_fixture_preserves_prefix_before_invalid_mode() {
+    let bytes = fixture!("difa/examples/sample.adif");
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let Section::Header(header) = next_section(&mut parser) else {
+        panic!("fixture should start with a header");
+    };
     assert_eq!(
-        file.header
-            .expect("input should yield a header because it starts with a preamble")
+        header
             .field("ADIF_VER")
-            .expect("header should contain ADIF_VER from the fixture descriptor")
+            .expect("fixture header should contain ADIF_VER")
             .text(),
         "3.1.4"
     );
-    assert_eq!(file.records.len(), 3);
-    for (record, call, time) in [
-        (&file.records[0], "W1AW", "1430"),
-        (&file.records[1], "AB9BH", "1445"),
-        (&file.records[2], "W6RQ", "083000"),
-    ] {
-        assert_eq!(named(record, "CALL").text(), call);
-        assert_eq!(named(record, "TIME_ON").text(), time);
+    for (call, time) in [("W1AW", "1430"), ("AB9BH", "1445")] {
+        let section = next_section(&mut parser);
+        let Section::Record(record) = section else {
+            panic!("expected {call} record, got {section:?}");
+        };
+        assert_eq!(named(&record, "CALL").text(), call);
+        assert_eq!(named(&record, "TIME_ON").text(), time);
     }
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(error.kind(), error::StructuralErrorKind::InvalidValue {field_name, enumeration: Some("Mode"), ..} if field_name == "MODE"),
+        "{error:?}"
+    );
+    assert_eq!(&bytes[error.span()], b"Q65");
+    assert_exhausted(&mut parser);
 }
 
 #[test]
@@ -1043,14 +1049,41 @@ fn upstream_undercount_fixture_preserves_framed_cr_without_value_validation() {
         (LengthUnit::Bytes, "Juán Muñoz UNDER"),
         (LengthUnit::UnicodeScalars, "Juán Muñoz UNDER\r\n"),
     ] {
-        let record = fixture_record(bytes, ParseEncoding::Utf8, unit);
-        assert_eq!(named(&record, "NAME").raw_data, expected_name.as_bytes());
-        for name in ["NOTES", "COMMENT"] {
-            assert_eq!(
-                named(&record, name).raw_data,
-                b"UTF with undercount if read as ISO\r"
-            );
+        let mut input = stream(bytes, ParseEncoding::Utf8, unit);
+        parse_ok(header, &mut input);
+        for expected in [
+            "band", "call", "freq", "mode", "name", "qso_date", "time_on", "notes", "comment",
+        ] {
+            let framed = parse_ok(terminated(framed_field, take_till(0.., b'<')), &mut input);
+            assert_eq!(framed.specifier.name, expected);
+            match expected {
+                "name" => assert_eq!(framed.raw_data, expected_name.as_bytes()),
+                "notes" | "comment" => {
+                    assert_eq!(framed.raw_data, b"UTF with undercount if read as ISO\r")
+                }
+                _ => {}
+            }
         }
+        let mut parser = Parser::new(
+            bytes,
+            ParseOpts {
+                encoding: ParseEncoding::Utf8,
+                field_length: unit,
+            },
+        );
+        let _ = next_section(&mut parser);
+        let error = next_error(&mut parser);
+        let expected_field = if unit == LengthUnit::Bytes {
+            "notes"
+        } else {
+            "name"
+        };
+        assert!(
+            matches!(error.kind(), error::StructuralErrorKind::InvalidValue {field_name, ..} if field_name == expected_field),
+            "{error:?}"
+        );
+        assert_eq!(&bytes[error.span()], b"\r");
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -1080,10 +1113,10 @@ fn upstream_overcount_fixture_scalar_boundary_includes_the_next_open_bracket() {
     // These original fixture fields precede NAME. Parse them individually so
     // we can assert the disputed boundary without requiring recovery afterward.
     for name in ["band", "call", "freq", "mode"] {
-        let parsed = parse_ok(terminated(field, take_till(0.., b'<')), &mut input);
+        let parsed = parse_ok(terminated(framed_field, take_till(0.., b'<')), &mut input);
         assert_eq!(parsed.specifier.name, name);
     }
-    let name = parse_ok(field, &mut input);
+    let name = parse_ok(framed_field, &mut input);
     assert_eq!(name.raw_data, "Juán Muñoz Marín OVER\r\n<".as_bytes());
     assert!(input.input.as_ref().starts_with(b"qso_date:8>"));
 }
@@ -1140,7 +1173,8 @@ fn public_accessors_preserve_syntactic_spans_across_records() {
         .expect("section should contain NAME from the supplied descriptor");
     assert_eq!(a.name(), "NAME");
     assert_eq!(a.declared_length(), 1);
-    assert_eq!(a.data_type(), None);
+    assert_eq!(a.data_type(), Some(DataType::String));
+    assert_eq!(a.type_indicator(), None);
     assert_eq!(a.descriptor_span(), 4..12);
     assert_eq!(a.value_span(), 12..13);
     assert_eq!(&bytes[a.value_span()], a.raw_data());
@@ -1192,10 +1226,10 @@ fn header_spans_use_original_bytes_and_exclude_following_separators() {
 #[test]
 fn duplicate_names_are_rejected_with_both_descriptor_locations() {
     for (bytes, first, second) in [
-        (&b"<NAME:3>Ray<name:3>Ray<EOR>"[..], 0..8, 11..19),
-        (&b"<NAME:3>Ray<NAME:3>Ann<EOR>"[..], 0..8, 11..19),
-        (&b"<NAME:3:S>Ray<name:3:S>Ray<EOR>"[..], 0..10, 13..23),
-        (&b"<NAME:3:S>Ray<name:3:N>123<EOR>"[..], 0..10, 13..23),
+        (&b"<TEST:3>Ray<test:3>Ray<EOR>"[..], 0..8, 11..19),
+        (&b"<TEST:3>Ray<TEST:3>Ann<EOR>"[..], 0..8, 11..19),
+        (&b"<TEST:3:S>Ray<test:3:S>Ray<EOR>"[..], 0..10, 13..23),
+        (&b"<TEST:3:S>Ray<test:3:N>123<EOR>"[..], 0..10, 13..23),
     ] {
         for is_header in [false, true] {
             let mut document = Vec::new();
@@ -1208,7 +1242,7 @@ fn duplicate_names_are_rejected_with_both_descriptor_locations() {
             document.extend_from_slice(if is_header { b"<EOH>" } else { b"<EOR>" });
             let shift = usize::from(is_header);
             let error = adi_file.parse(ascii_stream(&document)).expect_err(&format!(
-                "section should fail because NAME repeats ignoring ASCII case: {document:?}"
+                "section should fail because TEST repeats ignoring ASCII case: {document:?}"
             ));
             assert_eq!(error.offset(), second.start + shift);
             let cause = error
@@ -1224,7 +1258,7 @@ fn duplicate_names_are_rejected_with_both_descriptor_locations() {
             else {
                 panic!("expected duplicate error, got {cause:?}");
             };
-            assert!(field_name.eq_ignore_ascii_case("NAME"));
+            assert!(field_name.eq_ignore_ascii_case("TEST"));
             assert_eq!(*first_span, (first.start + shift)..(first.end + shift));
             assert_eq!(*second_span, (second.start + shift)..(second.end + shift));
         }

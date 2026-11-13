@@ -17,6 +17,7 @@ use crate::adif::{
 };
 
 mod declarations;
+mod definitions;
 pub(super) mod error;
 #[cfg(test)]
 mod tests;
@@ -228,6 +229,7 @@ fn eoh<'a>(input: &mut Stream<'a>) -> Result<Range<usize>> {
         .parse_next(input)
 }
 
+#[derive(Clone)]
 struct FramedField<'a> {
     specifier: DataSpecifier<'a>,
     raw_data: &'a [u8],
@@ -237,20 +239,33 @@ struct FramedField<'a> {
 }
 
 fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
-    let f = framed_field(input)?;
-    let kind = f.specifier.type_indicator;
-
-    values::parse(input, f, kind)
+    let (specifier, span) = data_specifier.with_span().parse_next(input)?;
+    let resolution = definitions::resolve(
+        &input.state,
+        crate::adif::catalog::FieldSection::Record,
+        &specifier,
+        span.clone(),
+    )
+    .map_err(|error| ContextError::from_external_error(input, error))?;
+    let f = frame_value(input, specifier, span)?;
+    definitions::parse_resolved(input, f, &resolution)
 }
 
 fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
-    let f = framed_field(input)?;
-
-    if declarations::is_declaration(&f.specifier.name) {
+    let (specifier, span) = data_specifier.with_span().parse_next(input)?;
+    if declarations::is_declaration(&specifier.name) {
+        let f = frame_value(input, specifier, span)?;
         declarations::parse(input, f).map(HeaderEntry::UserDefinition)
     } else {
-        let kind = f.specifier.type_indicator;
-        values::parse(input, f, kind).map(HeaderEntry::Field)
+        let resolution = definitions::resolve(
+            &input.state,
+            crate::adif::catalog::FieldSection::Header,
+            &specifier,
+            span.clone(),
+        )
+        .map_err(|error| ContextError::from_external_error(input, error))?;
+        let f = frame_value(input, specifier, span)?;
+        definitions::parse_resolved(input, f, &resolution).map(HeaderEntry::Field)
     }
 }
 
@@ -276,6 +291,7 @@ fn unique_header_entry<'a>(
     Ok(entry)
 }
 
+#[cfg(test)]
 fn framed_field<'a>(input: &mut Stream<'a>) -> Result<FramedField<'a>> {
     let (specifier, descriptor_span) = data_specifier.with_span().parse_next(input)?;
     frame_value(input, specifier, descriptor_span)
@@ -554,7 +570,8 @@ mod test {
         assert_eq!(parsed.text(), "Ray");
         assert_eq!(parsed.descriptor_span(), 0..8);
         assert_eq!(parsed.value_span(), 8..11);
-        assert_eq!(parsed.data_type(), None);
+        assert_eq!(parsed.data_type(), Some(DataType::String));
+        assert_eq!(parsed.type_indicator(), None);
     }
 
     #[test]

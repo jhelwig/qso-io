@@ -9,7 +9,6 @@ use crate::adif::{
 
 /// The syntactic requirement that an ADI input failed to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SyntaxErrorKind {
     /// A field descriptor is incomplete or does not match the ADI syntax.
     MalformedDescriptor,
@@ -28,9 +27,26 @@ pub enum SyntaxErrorKind {
 }
 
 /// Structured details of a terminal ADI parsing failure.
-#[derive(Debug)]
-#[non_exhaustive]
+#[derive(Debug, Clone)]
 pub enum StructuralErrorKind {
+    /// An inline indicator conflicts with the field's defined type.
+    TypeConflict {
+        /// Original field name.
+        field_name: String,
+        /// Types permitted by the definition, including types with no indicator.
+        expected: Vec<DataType>,
+        /// Type named by the supplied inline indicator.
+        supplied: DataType,
+        /// USERDEF declaration or first application descriptor establishing type.
+        definition_span: Option<Range<usize>>,
+    },
+    /// No permitted standard type accepts the supplied value.
+    NoMatchingType {
+        /// Original field name.
+        field_name: String,
+        /// Failures in preference order; the first supplies the primary span.
+        failures: Vec<TypeAlternativeFailure>,
+    },
     /// Malformed syntax or a required section terminator missing at EOF.
     Syntax {
         /// The specific syntactic requirement that was not satisfied.
@@ -72,7 +88,7 @@ pub enum StructuralErrorKind {
         /// Declaration-specific reason.
         cause: UserDefinitionError,
     },
-    /// A recognized type indicator is unavailable in ADI.
+    /// An ADIF data type is unavailable in ADI.
     TypeUnavailableInAdi {
         /// Recognized ADIF data type.
         data_type: DataType,
@@ -82,6 +98,39 @@ pub enum StructuralErrorKind {
         /// Decoding cause, with offsets relative to the field or preamble.
         cause: DecodeError,
     },
+}
+
+/// A failed value conversion for one permitted standard field type.
+#[derive(Debug, Clone)]
+pub struct TypeAlternativeFailure {
+    pub(super) data_type: DataType,
+    pub(super) span: Range<usize>,
+    pub(super) cause: ValueError,
+    pub(super) enumeration: Option<&'static str>,
+}
+
+impl TypeAlternativeFailure {
+    /// Returns the attempted ADIF type.
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    /// Returns the failure's original input byte range.
+    pub fn span(&self) -> Range<usize> {
+        self.span.clone()
+    }
+
+    /// Borrows the type-specific failure reason.
+    pub fn cause(&self) -> &ValueError {
+        &self.cause
+    }
+
+    /// Returns the expected standard enumeration, when membership failed.
+    ///
+    /// The static label can be retained independently of this failure.
+    pub fn enumeration(&self) -> Option<&'static str> {
+        self.enumeration
+    }
 }
 
 /// A structural error located in the original input byte slice.
@@ -115,6 +164,7 @@ impl StructuralError {
         if let Some(cause) = error.cause().and_then(|e| e.downcast_ref::<AdiError>()) {
             let (kind, span, source): (_, _, Option<Box<dyn StdError + Send + Sync>>) =
                 match cause.clone() {
+                    AdiError::Defined { kind, span } => (kind, span, None),
                     AdiError::TruncatedValue {
                         field_name,
                         declared,
@@ -253,6 +303,29 @@ impl fmt::Display for StructuralError {
             self.span.start, self.span.end
         )?;
         match &self.kind {
+            StructuralErrorKind::TypeConflict {
+                field_name,
+                expected,
+                supplied,
+                ..
+            } => write!(
+                f,
+                "type conflict for {field_name}: expected {expected:?}, supplied {supplied:?}"
+            ),
+            StructuralErrorKind::NoMatchingType {
+                field_name,
+                failures,
+            } => {
+                write!(f, "no permitted type accepts {field_name}")?;
+                for failure in failures {
+                    write!(
+                        f,
+                        "; {:?}: {} at bytes {}..{}",
+                        failure.data_type, failure.cause, failure.span.start, failure.span.end
+                    )?;
+                }
+                Ok(())
+            }
             StructuralErrorKind::Syntax { reason } => write!(
                 f,
                 "{}",
@@ -323,6 +396,11 @@ impl StdError for StructuralError {
 
 #[derive(Debug, Error, Clone)]
 pub(super) enum AdiError {
+    #[error("field definition validation failed")]
+    Defined {
+        kind: StructuralErrorKind,
+        span: Range<usize>,
+    },
     #[error("duplicate field {field_name}")]
     DuplicateField {
         field_name: String,
