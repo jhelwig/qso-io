@@ -1,9 +1,11 @@
-use std::{error::Error as StdError, fmt, num::ParseIntError, ops::Range, str::Utf8Error};
+use std::{error::Error as StdError, fmt, num::ParseIntError, ops::Range};
 
 use thiserror::Error;
 use winnow::error::{ContextError, StrContext, StrContextValue};
 
-use crate::adif::{DataTypeError, LengthUnit};
+use crate::adif::{
+    DataType, DataTypeError, DecodeError, LengthUnit, ValueError, adi::UserDefinitionError,
+};
 
 /// The syntactic requirement that an ADI input failed to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,19 +56,36 @@ pub enum StructuralErrorKind {
         /// Repeated descriptor's original byte range and primary error location.
         second_span: Range<usize>,
     },
-    /// Invalid or incomplete UTF-8 prevented scalar-counted value framing.
-    ///
-    /// UTF-8 failures in reliably byte-framed text are stored as
-    /// [`crate::adif::DecodeError`] instead.
-    InvalidUtf8 {
-        /// Standard decoding cause, relative to the error sequence's start.
-        cause: Utf8Error,
+    /// Nonempty field contents fail their explicit ADIF type grammar.
+    InvalidValue {
+        /// Original field name.
+        field_name: String,
+        /// Declared type whose grammar failed.
+        cause: ValueError,
+    },
+    /// A USERDEFn declaration failed its own grammar or range requirements.
+    InvalidUserDefinition {
+        /// Original descriptor name.
+        field_name: String,
+        /// Declaration-specific reason.
+        cause: UserDefinitionError,
+    },
+    /// A recognized type indicator is unavailable in ADI.
+    TypeUnavailableInAdi {
+        /// Recognized ADIF data type.
+        data_type: DataType,
+    },
+    /// Text decoding failed in a field or header preamble.
+    Decoding {
+        /// Decoding cause, with offsets relative to the field or preamble.
+        cause: DecodeError,
     },
 }
 
 /// A structural error located in the original input byte slice.
 ///
-/// Spans have exclusive ends. EOF failures have an empty span at input length.
+/// Spans have exclusive ends. Truncated values and missing terminators have an
+/// empty span at input length; invalid bounded values can point inside the input.
 /// Display reports the byte range and error details.
 #[derive(Debug)]
 pub struct StructuralError {
@@ -83,6 +102,7 @@ impl StructuralError {
     pub fn span(&self) -> Range<usize> {
         self.span.clone()
     }
+
     /// Borrows structured details independently of the formatted message.
     pub fn kind(&self) -> &StructuralErrorKind {
         &self.kind
@@ -121,8 +141,33 @@ impl StructuralError {
                         second_span,
                         None,
                     ),
-                    AdiError::InvalidUtf8 { span, cause } => {
-                        (StructuralErrorKind::InvalidUtf8 { cause }, span, None)
+                    AdiError::InvalidValue {
+                        field_name,
+                        span,
+                        cause,
+                        numeric_cause,
+                    } => (
+                        StructuralErrorKind::InvalidValue { field_name, cause },
+                        span,
+                        numeric_cause.map(|e| Box::new(e) as _),
+                    ),
+                    AdiError::InvalidUserDefinition {
+                        field_name,
+                        span,
+                        cause,
+                        numeric_cause,
+                    } => (
+                        StructuralErrorKind::InvalidUserDefinition { field_name, cause },
+                        span,
+                        numeric_cause.map(|e| Box::new(e) as _),
+                    ),
+                    AdiError::TypeUnavailableInAdi { data_type, span } => (
+                        StructuralErrorKind::TypeUnavailableInAdi { data_type },
+                        span,
+                        None,
+                    ),
+                    AdiError::Decoding { span, cause } => {
+                        (StructuralErrorKind::Decoding { cause }, span, None)
                     }
                     AdiError::Syntax {
                         reason,
@@ -233,8 +278,17 @@ impl fmt::Display for StructuralError {
                 "duplicate field {field_name}; first descriptor at bytes {}..{}",
                 first_span.start, first_span.end
             ),
-            StructuralErrorKind::InvalidUtf8 { cause } => {
-                write!(f, "cannot determine scalar value boundary: {cause}")
+            StructuralErrorKind::InvalidValue { field_name, cause } => {
+                write!(f, "invalid value for {field_name}: {cause}")
+            }
+            StructuralErrorKind::InvalidUserDefinition { field_name, cause } => {
+                write!(f, "invalid declaration {field_name}: {cause}")
+            }
+            StructuralErrorKind::TypeUnavailableInAdi { data_type } => {
+                write!(f, "type {data_type:?} is unavailable in ADI")
+            }
+            StructuralErrorKind::Decoding { cause } => {
+                write!(f, "text decoding failed: {cause}")
             }
         }
     }
@@ -242,10 +296,19 @@ impl fmt::Display for StructuralError {
 
 impl StdError for StructuralError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        if let StructuralErrorKind::InvalidUtf8 { cause } = &self.kind {
+        if let StructuralErrorKind::Decoding { cause } = &self.kind {
             return Some(cause);
         }
-        self.cause.as_deref().map(|e| e as _)
+        if let Some(cause) = self.cause.as_deref() {
+            return Some(cause);
+        }
+        if let StructuralErrorKind::InvalidValue { cause, .. } = &self.kind {
+            return Some(cause);
+        }
+        if let StructuralErrorKind::InvalidUserDefinition { cause, .. } = &self.kind {
+            return Some(cause);
+        }
+        None
     }
 }
 
@@ -266,11 +329,30 @@ pub(super) enum AdiError {
         available: usize,
         unit: LengthUnit,
     },
-    #[error("invalid UTF-8 during scalar framing: {cause}")]
-    InvalidUtf8 {
+    #[error("invalid value for {field_name}: {cause}")]
+    InvalidValue {
+        field_name: String,
+        span: Range<usize>,
+        cause: ValueError,
+        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+    },
+    #[error("invalid declaration {field_name}: {cause}")]
+    InvalidUserDefinition {
+        field_name: String,
+        span: Range<usize>,
+        cause: UserDefinitionError,
+        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+    },
+    #[error("type {data_type:?} is unavailable in ADI")]
+    TypeUnavailableInAdi {
+        data_type: DataType,
+        span: Range<usize>,
+    },
+    #[error("text decoding failed: {cause}")]
+    Decoding {
         span: Range<usize>,
         #[source]
-        cause: Utf8Error,
+        cause: DecodeError,
     },
     #[error("invalid field length: {reason:?}")]
     Syntax {

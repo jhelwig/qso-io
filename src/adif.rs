@@ -1,16 +1,106 @@
-//! Amateur Data Interchange Format (ADIF) types and ADI parsing options.
+//! Amateur Data Interchange Format (ADIF) types and ADI parsing.
 //!
-//! The [`adi`](crate::adif::adi) module reads length-delimited ADI sections.
+//! Start with [`adi::Parser`] and [`ParseOpts`] to read ADI records while
+//! preserving their original bytes and source locations. Parsing yields complete
+//! headers and records. Structural errors, including text-decoding failures,
+//! terminate iteration while leaving previously yielded sections available.
+//!
 //! Reference enums describe ADIF value categories and enumeration members.
+//!
+//! # Declared values
+//!
+//! Explicit ADI indicators select stored values. Untyped contents retain decoded
+//! text. A supplied zero-length field has no value; lookup distinguishes it from
+//! an absent field. Original spelling and source bytes remain available.
+//!
+//! ```
+//! use qso_io::adif::{adi::{Parser, Section}, ParseOpts, Value};
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut parser = Parser::new(b"<FREQ:6:N>14.074<NOTE:0><EOR>", ParseOpts::default());
+//! let record = match parser
+//!     .next()
+//!     .expect("example should yield a record because it supplies fields followed by EOR")?
+//! {
+//!     Section::Record(record) => record,
+//!     other => panic!("expected record, got {other:?}"),
+//! };
+//! let frequency = record
+//!     .field("freq")
+//!     .expect("record should contain FREQ from the supplied descriptor");
+//! assert!(matches!(frequency.value(), Some(Value::Number(_))), "expected Number, got {:?}", frequency.value());
+//! assert_eq!(frequency.text(), "14.074");
+//! assert!(
+//!     record
+//!         .field("NOTE")
+//!         .expect("record should contain NOTE because the example supplies <NOTE:0>")
+//!         .value()
+//!         .is_none()
+//! );
+//! assert!(record.field("MISSING").is_none());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Declared text and encodings
+//!
+//! [`ParseOpts::encoding`] selects both decoding and the character
+//! repertoire for declared String (`S`), MultilineString (`M`) and Enumeration
+//! (`E`) values. These are qso-io's explicit compatibility rules:
+//!
+//! | Encoding | String and Enumeration | MultilineString |
+//! | --- | --- | --- |
+//! | ASCII | U+0020–U+007E | Same characters plus CRLF pairs |
+//! | Latin-1 | U+0020–U+007E and U+00A0–U+00FF | Same characters plus CRLF pairs |
+//! | UTF-8 | Valid Unicode except CR and LF | Same characters plus CRLF pairs |
+//!
+//! All modes reject lone CR/LF in MultilineString. UTF-8 permits other controls,
+//! including TAB, NUL, DEL and C1; ASCII and Latin-1 use the narrower ranges
+//! above. The UTF-8 compatibility rule follows ADIF's international-text
+//! definitions. The `I` and `G` indicators themselves are unavailable in ADI.
+//! Untyped field contents use decoding alone. USERDEF enumeration members use
+//! the String rules above, retaining each member's spelling and order.
+//!
+//! # User-field declarations
+//!
+//! Headers expose ordinary fields and structured USERDEFn declarations through
+//! `entries()`. A declaration describes a record field; its optional indicator
+//! and parsed constraints are retained separately from its original text.
+//!
+//! ```
+//! use qso_io::adif::{adi::{HeaderEntry, Parser, Section}, DataType, ParseOpts};
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut parser = Parser::new(b"P<USERDEF1:3:N>EPC<EOH>", ParseOpts::default());
+//! let header = match parser
+//!     .next()
+//!     .expect("example should yield a header because it starts with a preamble")?
+//! {
+//!     Section::Header(header) => header,
+//!     other => panic!("expected header, got {other:?}"),
+//! };
+//! let definition = match &header.entries()[0] {
+//!     HeaderEntry::UserDefinition(definition) => definition,
+//!     other => panic!("expected USERDEF declaration, got {other:?}"),
+//! };
+//! assert_eq!(definition.field_name(), "EPC");
+//! assert_eq!(definition.data_type(), Some(DataType::Number));
+//! assert_eq!(definition.text(), "EPC");
+//! # Ok(())
+//! # }
+//! ```
 
 use std::{borrow::Cow, ops::Range, str::Utf8Error};
 
 use chrono::NaiveDate;
 use thiserror::Error;
 
+pub use value::{AdifLocation, AdifTime, Hemisphere, TimePrecision, Value, ValueError};
+
 /// Borrowed ADI sections, their parser, and structural diagnostics.
 pub mod adi;
+mod number;
 mod parser;
+mod text;
+mod value;
 
 /// Explicit text encoding and declared-length interpretation for one parser.
 ///
@@ -25,6 +115,9 @@ pub struct ParseOpts {
 }
 
 /// How raw field values and preamble bytes are decoded into Unicode text.
+///
+/// The selected encoding also determines declared text character rules; see
+/// the [declared text table](crate::adif#declared-text-and-encodings).
 ///
 /// Latin-1 and UTF-8 provide explicit compatibility modes for non-ASCII input.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -55,15 +148,15 @@ pub enum LengthUnit {
 
 /// A complete length-framed field with immutable bytes and cached text decoding.
 ///
-/// Name casing and raw value bytes are preserved. Decoding failures are stored
-/// alongside the original bytes in the complete section.
+/// Name casing, raw value bytes and decoded spelling are preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field<'a> {
     specifier: DataSpecifier<'a>,
     raw_data: &'a [u8],
     descriptor_span: Range<usize>,
     value_span: Range<usize>,
-    text: Result<Cow<'a, str>, DecodeError>,
+    text: Option<Cow<'a, str>>,
+    value: Option<Value<'a>>,
 }
 
 impl<'a> Field<'a> {
@@ -71,24 +164,29 @@ impl<'a> Field<'a> {
     pub fn name(&self) -> &str {
         &self.specifier.name
     }
+
     /// Returns the descriptor's length in the unit selected by [`ParseOpts`].
     pub fn declared_length(&self) -> usize {
         self.specifier.length
     }
+
     /// Returns the data type identified by the descriptor's optional indicator.
     pub fn data_type(&self) -> Option<DataType> {
         self.specifier.data_type
     }
-    /// Borrows the original value bytes, including any bytes that fail decoding.
+
+    /// Borrows the original value bytes.
     pub fn raw_data(&self) -> &'a [u8] {
         self.raw_data
     }
+
     /// Returns the original byte range from the descriptor's `<` through `>`.
     ///
     /// The end is exclusive; value bytes are not included.
     pub fn descriptor_span(&self) -> Range<usize> {
         self.descriptor_span.clone()
     }
+
     /// Returns the original value's byte range with an exclusive end.
     ///
     /// An empty value has an empty range at its actual input position, and spans
@@ -97,16 +195,21 @@ impl<'a> Field<'a> {
         self.value_span.clone()
     }
 
-    /// Borrows the cached decoded text or its decoding error without re-decoding.
-    ///
-    /// Error offsets are relative to the value; add [`Self::value_span`]'s start
-    /// to locate an offending byte in the original input.
-    pub fn text(&self) -> Result<&str, &DecodeError> {
-        self.text.as_deref()
+    /// Borrows the original decoded spelling retained during parsing.
+    pub fn text(&self) -> &str {
+        match &self.value {
+            Some(Value::Text(text)) => text,
+            _ => self.text.as_deref().unwrap_or(""),
+        }
+    }
+
+    /// Borrows the stored value, or returns None for supplied zero-length contents.
+    pub fn value(&self) -> Option<&Value<'a>> {
+        self.value.as_ref()
     }
 }
 
-/// Text-decoding failure for bytes whose field or preamble boundary is known.
+/// Text-decoding cause retained by a located structural error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("Non-ASCII byte at offset {offset}")]
@@ -117,7 +220,7 @@ pub enum DecodeError {
         offset: usize,
     },
     #[error("UTF-8 decode: {0}")]
-    /// Invalid or incomplete UTF-8 in a reliably framed value or preamble.
+    /// Invalid or incomplete UTF-8 in field data or a header preamble.
     Utf8(
         /// Standard UTF-8 error; its offsets are relative to those raw bytes.
         #[from]

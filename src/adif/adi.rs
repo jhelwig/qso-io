@@ -2,22 +2,23 @@
 //!
 //! [`Parser`](crate::adif::adi::Parser) yields [`Section`](crate::adif::adi::Section)
 //! values in input order. Structural failures are
-//! terminal, while text-decoding errors remain stored in their complete fields
-//! or header preamble. All spans use original byte offsets and exclusive ends.
+//! terminal, including text-decoding failures in fields or header preambles. All spans use original byte offsets and exclusive ends.
 
 use std::{borrow::Cow, ops::Range};
 
-use crate::adif::{DecodeError, Field};
+use crate::adif::Field;
 
-mod parser;
-
+pub use header::{HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError};
 pub use parser::Parser;
 pub use parser::error::{StructuralError, StructuralErrorKind, SyntaxErrorKind};
+
+mod header;
+mod parser;
 
 /// A complete header or record from an ADI input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Section<'a> {
-    /// A header terminated by EOH, possibly containing stored decoding errors.
+    /// A complete decoded header terminated by EOH.
     Header(Header<'a>),
     /// A nonempty field sequence terminated by EOR.
     Record(Record<'a>),
@@ -36,7 +37,7 @@ pub struct AdiFile<'a> {
 /// A complete ADI header with its original preamble and ordered fields.
 ///
 /// Its source span ends after EOH's closing `>` and excludes following
-/// separators. Preamble and field decoding errors are stored in the header.
+/// separators. Its preamble and fields have successfully decoded text.
 /// Field names are unique within the header under ASCII case-insensitive
 /// comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,31 +45,41 @@ pub struct Header<'a> {
     span: Range<usize>,
     text_bytes: &'a [u8],
     text_span: Range<usize>,
-    text: Result<Cow<'a, str>, DecodeError>,
-    fields: Vec<Field<'a>>,
+    text: Cow<'a, str>,
+    entries: Vec<HeaderEntry<'a>>,
 }
 
 impl<'a> Header<'a> {
-    /// Borrows all fields in their original order.
-    pub fn fields(&self) -> &[Field<'a>] {
-        &self.fields
+    /// Borrows header fields and declarations in their original order.
+    pub fn entries(&self) -> &[HeaderEntry<'a>] {
+        &self.entries
     }
-    /// Finds a field by ASCII case-insensitive name, or returns `None`.
-    ///
-    /// The returned field retains its original name casing.
-    pub fn field(&self, name: &str) -> Option<&Field<'a>> {
-        self.fields
+
+    /// Finds an entry by its ASCII case-insensitive descriptor name.
+    pub fn entry(&self, name: &str) -> Option<&HeaderEntry<'a>> {
+        self.entries
             .iter()
-            .find(|f| f.name().eq_ignore_ascii_case(name))
+            .find(|e| e.name().eq_ignore_ascii_case(name))
     }
+
+    /// Finds an ordinary field; USERDEFn declarations are exposed through entries.
+    pub fn field(&self, name: &str) -> Option<&Field<'a>> {
+        match self.entry(name)? {
+            HeaderEntry::Field(f) => Some(f),
+            _ => None,
+        }
+    }
+
     /// Borrows the original preamble bytes, including line endings and blanks.
     pub fn raw_text(&self) -> &'a [u8] {
         self.text_bytes
     }
+
     /// Returns the preamble's original byte range, ending before the first `<`.
     pub fn text_span(&self) -> Range<usize> {
         self.text_span.clone()
     }
+
     /// Returns the byte range from the preamble's start through EOH's closing `>`.
     ///
     /// Offsets refer to the original input slice and the end is exclusive.
@@ -76,12 +87,9 @@ impl<'a> Header<'a> {
         self.span.clone()
     }
 
-    /// Borrows the cached preamble text or its decoding error without re-decoding.
-    ///
-    /// Add [`Self::text_span`]'s start to a decoding error's relative byte offset
-    /// to locate it within the original input.
-    pub fn text(&self) -> Result<&str, &DecodeError> {
-        self.text.as_deref()
+    /// Borrows the original decoded preamble retained during parsing.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -101,6 +109,7 @@ impl<'a> Record<'a> {
     pub fn fields(&self) -> &[Field<'a>] {
         &self.fields
     }
+
     /// Finds a field by ASCII case-insensitive name, or returns `None`.
     ///
     /// The returned field retains its original name casing.
@@ -109,6 +118,7 @@ impl<'a> Record<'a> {
             .iter()
             .find(|f| f.name().eq_ignore_ascii_case(name))
     }
+
     /// Returns the section's syntactic byte range, excluding surrounding separators.
     ///
     /// Offsets refer to the original input slice and the end is exclusive.
