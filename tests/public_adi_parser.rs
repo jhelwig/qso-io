@@ -1,14 +1,53 @@
 //! Consumer tests: only the public API is available in this module.
+use qso_io::adif::adi::StructuralError;
 use qso_io::adif::{
     DecodeError, LengthUnit, ParseEncoding, ParseOpts,
     adi::{Parser, Section, StructuralErrorKind, SyntaxErrorKind},
 };
 
+#[track_caller]
+fn next_section<'a>(parser: &mut Parser<'a>) -> Section<'a> {
+    match parser.next() {
+        Some(Ok(section)) => section,
+        other => panic!("expected a complete section, got {other:?}; remaining parser: {parser:?}"),
+    }
+}
+
+#[track_caller]
+fn next_error(parser: &mut Parser<'_>) -> StructuralError {
+    match parser.next() {
+        Some(Err(error)) => error,
+        other => {
+            panic!("expected a terminal parsing error, got {other:?}; remaining parser: {parser:?}")
+        }
+    }
+}
+
+#[track_caller]
+fn assert_exhausted(parser: &mut Parser<'_>) {
+    let actual = parser.next();
+    assert!(
+        actual.is_none(),
+        "expected permanent exhaustion, got {actual:?}; remaining parser: {parser:?}"
+    );
+}
+
+#[track_caller]
 fn record(section: Section<'_>) -> qso_io::adif::adi::Record<'_> {
     match section {
         Section::Record(record) => record,
         other => panic!("expected record, got {other:?}"),
     }
+}
+
+#[track_caller]
+fn named<'r, 'a>(
+    record: &'r qso_io::adif::adi::Record<'a>,
+    name: &str,
+) -> &'r qso_io::adif::Field<'a> {
+    record
+        .field(name)
+        .unwrap_or_else(|| panic!("expected field {name:?}, got {record:?}"))
 }
 
 #[test]
@@ -58,21 +97,38 @@ fn options_and_read_only_values_are_usable_by_a_consumer() {
                 field_length,
             },
         );
-        let record = record(parser.next().unwrap().unwrap());
-        let field = record.field("NAME").unwrap();
-        assert_eq!(field.name(), "nAmE");
-        assert_eq!(field.text().unwrap(), value);
-        assert_eq!(field.data_type(), Some(qso_io::adif::DataType::String));
+        let record = record(next_section(&mut parser));
+        let field = named(&record, "NAME");
+        assert_eq!(
+            field.name(),
+            "nAmE",
+            "{encoding:?}, {field_length:?}, input {bytes:?}"
+        );
+        assert_eq!(
+            field.text(),
+            value,
+            "{encoding:?}, {field_length:?}, input {bytes:?}"
+        );
+        assert_eq!(
+            field.data_type(),
+            Some(qso_io::adif::DataType::String),
+            "{encoding:?}, {field_length:?}, input {bytes:?}"
+        );
         assert_eq!(
             field.declared_length(),
             if field_length == LengthUnit::Bytes {
                 field.raw_data().len()
             } else {
                 value.chars().count()
-            }
+            },
+            "{encoding:?}, {field_length:?}, input {bytes:?}"
         );
-        assert_eq!(&bytes[field.value_span()], field.raw_data());
-        assert!(parser.next().is_none());
+        assert_eq!(
+            &bytes[field.value_span()],
+            field.raw_data(),
+            "{encoding:?}, {field_length:?}, input {bytes:?}"
+        );
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -89,7 +145,7 @@ fn sections_have_syntactic_spans_and_can_outlive_the_parser() {
     assert_eq!(header.span(), 0..19);
     assert_eq!(header.text_span(), 0..1);
     assert_eq!(header.raw_text(), b"P");
-    assert_eq!(header.text().unwrap(), "P");
+    assert_eq!(header.text(), "P");
     assert_eq!(header.fields().len(), 1);
     assert_eq!(header.field("programid").unwrap().value_span(), 14..14);
     for (section, expected) in sections.into_iter().skip(1).zip([21..35, 42..55]) {
@@ -105,33 +161,34 @@ fn sections_have_syntactic_spans_and_can_outlive_the_parser() {
 fn a_valid_prefix_is_yielded_before_one_terminal_error() {
     let bytes = b"P<EOH><NAME:1>A<EOR><NAME:1>B<EOR><NAME:3>Ra";
     let mut parser = Parser::new(bytes, ParseOpts::default());
-    assert!(matches!(
-        parser.next().unwrap().unwrap(),
-        Section::Header(_)
-    ));
+    let section = next_section(&mut parser);
+    assert!(
+        matches!(section, Section::Header(_)),
+        "expected header, got {section:?}"
+    );
     assert_eq!(
-        record(parser.next().unwrap().unwrap())
+        record(next_section(&mut parser))
             .field("NAME")
-            .unwrap()
-            .text()
-            .unwrap(),
+            .expect("section should contain NAME from the supplied descriptor")
+            .text(),
         "A"
     );
     assert_eq!(
-        record(parser.next().unwrap().unwrap())
+        record(next_section(&mut parser))
             .field("NAME")
-            .unwrap()
-            .text()
-            .unwrap(),
+            .expect("section should contain NAME from the supplied descriptor")
+            .text(),
         "B"
     );
-    let error = parser.next().unwrap().unwrap_err();
+    let error = next_error(&mut parser);
     assert_eq!(error.span(), bytes.len()..bytes.len());
     assert!(
-        matches!(error.kind(), StructuralErrorKind::TruncatedValue { field_name, declared: 3, available: 2, unit: LengthUnit::Bytes } if field_name == "NAME")
+        matches!(error.kind(), StructuralErrorKind::TruncatedValue { field_name, declared: 3, available: 2, unit: LengthUnit::Bytes } if field_name == "NAME"),
+        "unexpected value: {:?}",
+        error.kind()
     );
     for _ in 0..3 {
-        assert!(parser.next().is_none());
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -143,9 +200,9 @@ fn duplicate_errors_keep_original_locations_and_do_not_yield_the_bad_section() {
     ] {
         let mut parser = Parser::new(bytes, ParseOpts::default());
         if bytes.starts_with(b"<CALL") {
-            assert!(parser.next().unwrap().is_ok());
+            let _ = next_section(&mut parser);
         }
-        let error = parser.next().unwrap().unwrap_err();
+        let error = next_error(&mut parser);
         let StructuralErrorKind::DuplicateField {
             first_span,
             second_span,
@@ -158,7 +215,7 @@ fn duplicate_errors_keep_original_locations_and_do_not_yield_the_bad_section() {
         assert_eq!(&bytes[first_span.clone()], b"<NAME:1>");
         assert_eq!(&bytes[second_span.clone()], b"<name:1>");
         assert_eq!(error.span(), *second_span);
-        assert!(parser.next().is_none());
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -172,43 +229,54 @@ fn clean_exhaustion_is_fused_and_accepts_ignored_separators() {
         &b"<NAME:1>A<EOR> trailing text"[..],
     ] {
         let mut parser = Parser::new(bytes, ParseOpts::default());
-        for section in parser.by_ref() {
-            section.unwrap();
+        let records: Vec<_> = parser
+            .by_ref()
+            .map(|section| {
+                record(section.unwrap_or_else(|error| panic!("input {bytes:?}: {error}")))
+            })
+            .collect();
+        assert_eq!(
+            records.len(),
+            usize::from(!bytes.is_empty()),
+            "input {bytes:?}: {records:?}"
+        );
+        if let Some(record) = records.first() {
+            assert_eq!(
+                record
+                    .field("NAME")
+                    .expect("record should retain NAME from the supplied <NAME:1>A field")
+                    .text(),
+                "A",
+                "input {bytes:?}"
+            );
         }
         for _ in 0..3 {
-            assert!(parser.next().is_none());
+            assert_exhausted(&mut parser);
         }
     }
 }
 
 #[test]
-fn decoding_failures_are_locatable_and_do_not_stop_later_records() {
-    let bytes = b"P\xff<EOH><NAME:3>A\xffB<EOR><NAME:1>C<EOR>";
-    let mut parser = Parser::new(bytes, ParseOpts::default());
-    let Section::Header(header) = parser.next().unwrap().unwrap() else {
-        panic!("missing header");
-    };
-    let Err(DecodeError::NonAscii { offset }) = header.text() else {
-        panic!("expected non-ASCII error");
-    };
-    assert_eq!(header.text_span(), 0..2);
-    assert_eq!(bytes[header.text_span().start + offset], 0xff);
-    let bad_record = record(parser.next().unwrap().unwrap());
-    let field = bad_record.field("name").unwrap();
-    let Err(DecodeError::NonAscii { offset }) = field.text() else {
-        panic!("expected non-ASCII error");
-    };
-    assert_eq!(bytes[field.value_span().start + offset], 0xff);
-    assert_eq!(field.raw_data(), b"A\xffB");
-    assert_eq!(
-        record(parser.next().unwrap().unwrap())
-            .field("name")
-            .unwrap()
-            .text()
-            .unwrap(),
-        "C"
-    );
-    assert!(parser.next().is_none());
+fn decoding_failures_are_locatable_and_terminal() {
+    for (bytes, expected) in [
+        (&b"P\xff<EOH><NAME:1>C<EOR>"[..], 1..2),
+        (&b"<NAME:3>A\xffB<EOR><NAME:1>C<EOR>"[..], 9..10),
+    ] {
+        let mut parser = Parser::new(bytes, ParseOpts::default());
+        let error = next_error(&mut parser);
+        assert_eq!(error.span(), expected);
+        assert!(
+            matches!(
+                error.kind(),
+                StructuralErrorKind::Decoding {
+                    cause: DecodeError::NonAscii { .. }
+                }
+            ),
+            "unexpected value: {:?}",
+            error.kind()
+        );
+        assert_exhausted(&mut parser);
+    }
 }
 
 #[test]
@@ -226,20 +294,26 @@ fn scalar_utf8_errors_retain_causes_and_do_not_search_for_recovery() {
                 field_length: LengthUnit::UnicodeScalars,
             },
         );
-        let error = parser.next().unwrap().unwrap_err();
+        let error = next_error(&mut parser);
         assert_eq!(error.span(), expected_span);
-        let StructuralErrorKind::InvalidUtf8 { cause } = error.kind() else {
+        let StructuralErrorKind::Decoding {
+            cause: DecodeError::Utf8(cause),
+        } = error.kind()
+        else {
             panic!("{error:?}");
         };
         assert_eq!(cause.error_len(), error_len);
+        let decoding = error
+            .source()
+            .unwrap_or_else(|| panic!("expected decoding cause for {bytes:?}: {error:?}"));
+        let utf8 = decoding
+            .source()
+            .unwrap_or_else(|| panic!("expected UTF-8 source for {bytes:?}: {decoding:?}"));
         assert!(
-            error
-                .source()
-                .unwrap()
-                .downcast_ref::<std::str::Utf8Error>()
-                .is_some()
+            utf8.downcast_ref::<std::str::Utf8Error>().is_some(),
+            "expected UTF-8 source for {bytes:?}, got {utf8:?}"
         );
-        assert!(parser.next().is_none());
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -256,11 +330,11 @@ fn public_syntax_errors_distinguish_missing_ends_and_bad_descriptors() {
         (&b"<NAME:1"[..], SyntaxErrorKind::MalformedDescriptor),
     ] {
         let mut parser = Parser::new(bytes, ParseOpts::default());
-        let error = parser.next().unwrap().unwrap_err();
+        let error = next_error(&mut parser);
         assert!(
             matches!(error.kind(), StructuralErrorKind::Syntax { reason: actual } if *actual == reason),
-            "{error:?}"
+            "input {bytes:?}: expected {reason:?}, got {error:?}"
         );
-        assert!(parser.next().is_none());
+        assert_exhausted(&mut parser);
     }
 }

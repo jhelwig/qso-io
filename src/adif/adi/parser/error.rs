@@ -1,9 +1,9 @@
-use std::{error::Error as StdError, fmt, num::ParseIntError, ops::Range, str::Utf8Error};
+use std::{error::Error as StdError, fmt, num::ParseIntError, ops::Range};
 
 use thiserror::Error;
 use winnow::error::{ContextError, StrContext, StrContextValue};
 
-use crate::adif::{DataTypeError, LengthUnit};
+use crate::adif::{DataTypeError, DecodeError, LengthUnit};
 
 /// The syntactic requirement that an ADI input failed to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,13 +54,10 @@ pub enum StructuralErrorKind {
         /// Repeated descriptor's original byte range and primary error location.
         second_span: Range<usize>,
     },
-    /// Invalid or incomplete UTF-8 prevented scalar-counted value framing.
-    ///
-    /// UTF-8 failures in reliably byte-framed text are stored as
-    /// [`crate::adif::DecodeError`] instead.
-    InvalidUtf8 {
-        /// Standard decoding cause, relative to the error sequence's start.
-        cause: Utf8Error,
+    /// Text decoding failed in a field or header preamble.
+    Decoding {
+        /// Decoding cause, with offsets relative to the field or preamble.
+        cause: DecodeError,
     },
 }
 
@@ -83,6 +80,7 @@ impl StructuralError {
     pub fn span(&self) -> Range<usize> {
         self.span.clone()
     }
+
     /// Borrows structured details independently of the formatted message.
     pub fn kind(&self) -> &StructuralErrorKind {
         &self.kind
@@ -121,8 +119,8 @@ impl StructuralError {
                         second_span,
                         None,
                     ),
-                    AdiError::InvalidUtf8 { span, cause } => {
-                        (StructuralErrorKind::InvalidUtf8 { cause }, span, None)
+                    AdiError::Decoding { span, cause } => {
+                        (StructuralErrorKind::Decoding { cause }, span, None)
                     }
                     AdiError::Syntax {
                         reason,
@@ -233,8 +231,8 @@ impl fmt::Display for StructuralError {
                 "duplicate field {field_name}; first descriptor at bytes {}..{}",
                 first_span.start, first_span.end
             ),
-            StructuralErrorKind::InvalidUtf8 { cause } => {
-                write!(f, "cannot determine scalar value boundary: {cause}")
+            StructuralErrorKind::Decoding { cause } => {
+                write!(f, "text decoding failed: {cause}")
             }
         }
     }
@@ -242,7 +240,7 @@ impl fmt::Display for StructuralError {
 
 impl StdError for StructuralError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        if let StructuralErrorKind::InvalidUtf8 { cause } = &self.kind {
+        if let StructuralErrorKind::Decoding { cause } = &self.kind {
             return Some(cause);
         }
         self.cause.as_deref().map(|e| e as _)
@@ -266,11 +264,11 @@ pub(super) enum AdiError {
         available: usize,
         unit: LengthUnit,
     },
-    #[error("invalid UTF-8 during scalar framing: {cause}")]
-    InvalidUtf8 {
+    #[error("text decoding failed: {cause}")]
+    Decoding {
         span: Range<usize>,
         #[source]
-        cause: Utf8Error,
+        cause: DecodeError,
     },
     #[error("invalid field length: {reason:?}")]
     Syntax {

@@ -55,15 +55,14 @@ pub enum LengthUnit {
 
 /// A complete length-framed field with immutable bytes and cached text decoding.
 ///
-/// Name casing and raw value bytes are preserved. Decoding failures are stored
-/// alongside the original bytes in the complete section.
+/// Name casing, raw value bytes and decoded spelling are preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field<'a> {
     specifier: DataSpecifier<'a>,
     raw_data: &'a [u8],
     descriptor_span: Range<usize>,
     value_span: Range<usize>,
-    text: Result<Cow<'a, str>, DecodeError>,
+    text: Cow<'a, str>,
 }
 
 impl<'a> Field<'a> {
@@ -71,24 +70,29 @@ impl<'a> Field<'a> {
     pub fn name(&self) -> &str {
         &self.specifier.name
     }
+
     /// Returns the descriptor's length in the unit selected by [`ParseOpts`].
     pub fn declared_length(&self) -> usize {
         self.specifier.length
     }
+
     /// Returns the data type identified by the descriptor's optional indicator.
     pub fn data_type(&self) -> Option<DataType> {
         self.specifier.data_type
     }
+
     /// Borrows the original value bytes, including any bytes that fail decoding.
     pub fn raw_data(&self) -> &'a [u8] {
         self.raw_data
     }
+
     /// Returns the original byte range from the descriptor's `<` through `>`.
     ///
     /// The end is exclusive; value bytes are not included.
     pub fn descriptor_span(&self) -> Range<usize> {
         self.descriptor_span.clone()
     }
+
     /// Returns the original value's byte range with an exclusive end.
     ///
     /// An empty value has an empty range at its actual input position, and spans
@@ -97,16 +101,13 @@ impl<'a> Field<'a> {
         self.value_span.clone()
     }
 
-    /// Borrows the cached decoded text or its decoding error without re-decoding.
-    ///
-    /// Error offsets are relative to the value; add [`Self::value_span`]'s start
-    /// to locate an offending byte in the original input.
-    pub fn text(&self) -> Result<&str, &DecodeError> {
-        self.text.as_deref()
+    /// Borrows the original decoded spelling retained during parsing.
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
-/// Text-decoding failure for bytes whose field or preamble boundary is known.
+/// Text-decoding cause retained by a located structural error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("Non-ASCII byte at offset {offset}")]

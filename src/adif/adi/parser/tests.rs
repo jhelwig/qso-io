@@ -1,10 +1,54 @@
 //! ADIF 3.1.8 IV.A.1–6 framing tests and the crate's explicit encoding policies.
 //!
 //! These exercise qso-io's assembly, boundaries and error separation, not ADIF
-//! field-value validation or the underlying libraries in isolation. Fixture
+//! schema validation or the underlying libraries in isolation. Fixture
 //! expectations follow tests/fixtures/README.md, not upstream filenames.
 
+use super::error::StructuralError;
 use super::*;
+
+mod decoding;
+
+#[track_caller]
+fn next_section<'a>(parser: &mut Parser<'a>) -> Section<'a> {
+    match parser.next() {
+        Some(Ok(section)) => section,
+        other => panic!("expected a complete section, got {other:?}; remaining parser: {parser:?}"),
+    }
+}
+
+#[track_caller]
+fn next_error(parser: &mut Parser<'_>) -> StructuralError {
+    match parser.next() {
+        Some(Err(error)) => error,
+        other => {
+            panic!("expected a terminal parsing error, got {other:?}; remaining parser: {parser:?}")
+        }
+    }
+}
+
+#[track_caller]
+fn assert_exhausted(parser: &mut Parser<'_>) {
+    let actual = parser.next();
+    assert!(
+        actual.is_none(),
+        "expected permanent exhaustion, got {actual:?}; remaining parser: {parser:?}"
+    );
+}
+
+#[track_caller]
+fn parse_ok<'a, O>(
+    mut parser: impl winnow::Parser<Stream<'a>, O, ContextError>,
+    input: &mut Stream<'a>,
+) -> O {
+    let bytes = *input.input.as_ref();
+    parser.parse_next(input).unwrap_or_else(|error| {
+        panic!(
+            "expected successful parsing of {bytes:?}, got {error:?} at byte {}; stream: {input:?}",
+            input.current_token_start()
+        )
+    })
+}
 
 fn stream(bytes: &[u8], encoding: ParseEncoding, field_length: LengthUnit) -> Stream<'_> {
     Stream {
@@ -22,18 +66,88 @@ fn ascii_stream(bytes: &[u8]) -> Stream<'_> {
     stream(bytes, ParseEncoding::Ascii, LengthUnit::Bytes)
 }
 
+#[track_caller]
 fn parse_file(bytes: &[u8], encoding: ParseEncoding, unit: LengthUnit) -> AdiFile<'_> {
     adi_file
         .parse(stream(bytes, encoding, unit))
-        .unwrap_or_else(|error| panic!("complete ADI file should parse:\n{error}"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "complete ADI file should parse ({encoding:?}, {unit:?}, input {bytes:?}):\n{error}"
+            )
+        })
 }
 
+#[track_caller]
 fn named<'r, 'a>(record: &'r Record<'a>, name: &str) -> &'r Field<'a> {
     record
-        .fields
-        .iter()
-        .find(|field| field.specifier.name.eq_ignore_ascii_case(name))
-        .expect("expected fixture field")
+        .field(name)
+        .unwrap_or_else(|| panic!("expected field {name:?}, got {record:?}"))
+}
+
+#[track_caller]
+fn assert_two_records(bytes: &[u8]) {
+    let file = parse_file(bytes, ParseEncoding::Ascii, LengthUnit::Bytes);
+    assert_eq!(file.records.len(), 2);
+    assert_eq!(named(&file.records[0], "NAME").text(), "Ray");
+    assert_eq!(named(&file.records[1], "NAME").text(), "Ann");
+}
+
+#[track_caller]
+fn assert_not_missing_terminator(error: &ContextError, diagnostic: &str) {
+    assert!(
+        !error.context().any(|context| matches!(
+            context,
+            StrContext::Expected(StrContextValue::StringLiteral("<EOH>" | "<EOR>"))
+        )),
+        "field error was incorrectly reported as a missing section terminator:\n{diagnostic}"
+    );
+}
+
+#[track_caller]
+fn assert_truncation(
+    error: &winnow::error::ParseError<Stream<'_>, ContextError>,
+    field_name: &str,
+    declared: usize,
+    available: usize,
+    unit: LengthUnit,
+) {
+    let expected = format!(
+        "TruncatedValue for {field_name}: declared {declared} {unit:?}, \
+         available {available}; position at EOF (byte {})",
+        error.input().eof_offset(),
+    );
+    let cause = error
+        .inner()
+        .cause()
+        .and_then(|cause| cause.downcast_ref::<AdiError>());
+    assert!(
+        matches!(cause, Some(AdiError::TruncatedValue {
+            field_name: actual_name,
+            declared: actual_declared,
+            available: actual_available,
+            unit: actual_unit,
+        }) if actual_name == field_name
+            && *actual_declared == declared
+            && *actual_available == available
+            && *actual_unit == unit),
+        "expected {expected}\nactual cause: {cause:?}\nactual error:\n{error}"
+    );
+    assert_eq!(
+        error.offset(),
+        error.input().eof_offset(),
+        "expected {expected}\nactual error:\n{error}"
+    );
+    assert_not_missing_terminator(error.inner(), &error.to_string());
+}
+
+fn fixture_record(bytes: &[u8], encoding: ParseEncoding, unit: LengthUnit) -> Record<'_> {
+    let file = parse_file(bytes, encoding, unit);
+    assert!(file.header.is_some());
+    assert_eq!(file.records.len(), 1);
+    file.records
+        .into_iter()
+        .next()
+        .expect("a record should be present because the fixture record count was checked as one")
 }
 
 #[test]
@@ -43,13 +157,15 @@ fn descriptors_preserve_names_and_accept_zero_and_leading_zero_lengths() {
         (&b"<NAME:0><EOR>"[..], "NAME", 0),
     ] {
         let mut input = ascii_stream(bytes);
-        let parsed = data_specifier(&mut input).unwrap();
+        let parsed = parse_ok(data_specifier, &mut input);
         assert_eq!(parsed.name, name);
         assert_eq!(parsed.length, length);
         assert_eq!(parsed.data_type, None);
         assert_eq!(
             *input.input.as_ref(),
-            &bytes[bytes.iter().position(|b| *b == b'>').unwrap() + 1..]
+            &bytes[bytes.iter().position(|b| *b == b'>').expect(
+                "descriptor should contain > because the test case supplies a complete descriptor"
+            ) + 1..]
         );
     }
 }
@@ -91,10 +207,14 @@ fn malformed_lengths_and_descriptors_fail_structurally() {
         &b"<NAME:3x>Ray"[..],
         &b"<NAME:3"[..],
     ] {
-        assert!(field(&mut ascii_stream(bytes)).is_err(), "{bytes:?}");
+        field(&mut ascii_stream(bytes)).expect_err(&format!(
+            "input {bytes:?} should fail because its length descriptor is malformed"
+        ));
     }
     let overflow = format!("<NAME:{}0>", usize::MAX);
-    assert!(field(&mut ascii_stream(overflow.as_bytes())).is_err());
+    field(&mut ascii_stream(overflow.as_bytes())).expect_err(&format!(
+        "length {overflow:?} should fail because it exceeds usize::MAX"
+    ));
 }
 
 #[test]
@@ -106,7 +226,9 @@ fn unknown_empty_and_multiple_type_indicators_fail_structurally() {
         &b"<NAME:3:SS>Ray"[..],
         &b"<NAME:3:1>Ray"[..],
     ] {
-        assert!(field(&mut ascii_stream(bytes)).is_err(), "{bytes:?}");
+        field(&mut ascii_stream(bytes)).expect_err(&format!(
+            "input {bytes:?} should fail because its type indicator is unknown, empty, or multiple characters"
+        ));
     }
 }
 
@@ -127,7 +249,7 @@ fn invalid_field_values_do_not_invalidate_descriptor_syntax() {
         let mut input = ascii_stream(bytes);
         let parsed = field(&mut input).unwrap();
         assert_eq!(parsed.raw_data, raw);
-        assert_eq!(parsed.text().unwrap().as_bytes(), raw);
+        assert_eq!(parsed.text().as_bytes(), raw);
         assert_eq!(parsed.specifier.data_type, Some(expected_type));
         assert_eq!(input.eof_offset(), 0);
     }
@@ -142,10 +264,10 @@ fn zero_length_fields_leave_the_next_tag_untouched_in_every_mode() {
     ] {
         for unit in [LengthUnit::Bytes, LengthUnit::UnicodeScalars] {
             let mut input = stream(b"<NAME:0><EOR>", encoding, unit);
-            let parsed = field(&mut input).unwrap();
-            assert_eq!(parsed.raw_data, b"");
-            assert_eq!(parsed.text().unwrap(), "");
-            assert_eq!(*input.input.as_ref(), b"<EOR>");
+            let parsed = parse_ok(field, &mut input);
+            assert_eq!(parsed.raw_data, b"", "{encoding:?}, {unit:?}");
+            assert_eq!(parsed.text(), "", "{encoding:?}, {unit:?}");
+            assert_eq!(*input.input.as_ref(), b"<EOR>", "{encoding:?}, {unit:?}");
         }
     }
 }
@@ -158,17 +280,10 @@ fn value_lengths_protect_embedded_tags_punctuation_and_line_breaks() {
         (&b"<COMMENT:5>a:\r\nb<EOR>"[..], &b"a:\r\nb"[..]),
     ] {
         let mut input = ascii_stream(bytes);
-        let parsed = record(&mut input).unwrap();
+        let parsed = parse_ok(record, &mut input);
         assert_eq!(parsed.fields.len(), 1);
         assert_eq!(parsed.fields[0].raw_data, expected);
         assert_eq!(input.eof_offset(), 0);
-    }
-}
-
-#[test]
-fn byte_counted_values_truncated_at_eof_fail_structurally() {
-    for bytes in [&b"<NAME:3>Ra"[..], &b"<NAME:1>"[..]] {
-        assert!(field(&mut ascii_stream(bytes)).is_err());
     }
 }
 
@@ -193,13 +308,15 @@ fn files_detect_headers_from_the_first_byte_and_preserve_preambles() {
         );
         if let Some(header) = file.header {
             assert_eq!(
-                header.text().unwrap().as_bytes(),
-                expected_preamble.unwrap()
+                header.text().as_bytes(),
+                expected_preamble.expect(
+                    "expected preamble should be present because header presence was checked above"
+                )
             );
             assert!(header.fields.is_empty());
         }
         assert_eq!(file.records.len(), 1);
-        assert_eq!(named(&file.records[0], "NAME").text().unwrap(), "Ray");
+        assert_eq!(named(&file.records[0], "NAME").text(), "Ray");
     }
 }
 
@@ -211,7 +328,9 @@ fn malformed_headers_never_fall_back_to_headerless_parsing() {
         &b"Generated<PROGRAMID:x>abc<EOH><NAME:3>Ray<EOR>"[..],
         &b"\n<NAME:3>Ray<EOR>"[..],
     ] {
-        assert!(adi_file(&mut ascii_stream(bytes)).is_err(), "{bytes:?}");
+        adi_file(&mut ascii_stream(bytes)).expect_err(&format!(
+            "input {bytes:?} should fail because its header is malformed or lacks EOH"
+        ));
     }
 }
 
@@ -225,18 +344,11 @@ fn ignored_inter_field_text_preserves_field_order() {
     let fields = &file.records[0].fields;
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0].specifier.name, "NAME");
-    assert_eq!(fields[0].text().unwrap(), "Ray");
+    assert_eq!(fields[0].text(), "Ray");
     assert_eq!(fields[1].specifier.name, "QSO_DATE");
-    assert_eq!(fields[1].text().unwrap(), "19960513");
+    assert_eq!(fields[1].text(), "19960513");
     assert_eq!(fields[2].specifier.name, "qth");
-    assert_eq!(fields[2].text().unwrap(), "Ann");
-}
-
-fn assert_two_records(bytes: &[u8]) {
-    let file = parse_file(bytes, ParseEncoding::Ascii, LengthUnit::Bytes);
-    assert_eq!(file.records.len(), 2);
-    assert_eq!(named(&file.records[0], "NAME").text().unwrap(), "Ray");
-    assert_eq!(named(&file.records[1], "NAME").text().unwrap(), "Ann");
+    assert_eq!(fields[2].text(), "Ann");
 }
 
 #[test]
@@ -281,7 +393,9 @@ fn empty_or_unterminated_records_fail_structurally() {
         &b"<NAME:3>Ray"[..],
         &b"<NAME:3>Ray ignored text"[..],
     ] {
-        assert!(record(&mut ascii_stream(bytes)).is_err(), "{bytes:?}");
+        record(&mut ascii_stream(bytes)).expect_err(&format!(
+            "input {bytes:?} should fail because a record needs fields and an EOR terminator"
+        ));
     }
 }
 
@@ -339,10 +453,18 @@ fn encoding_and_length_options_select_the_expected_value_boundaries() {
         ),
     ] {
         let mut input = stream(bytes, encoding, unit);
-        let parsed = field(&mut input).unwrap();
+        let parsed = parse_ok(field, &mut input);
         assert_eq!(parsed.raw_data, raw, "{encoding:?}/{unit:?}");
-        assert_eq!(parsed.text().unwrap(), text);
-        assert_eq!(*input.input.as_ref(), b"<EOR>");
+        assert_eq!(
+            parsed.text(),
+            text,
+            "{encoding:?}, {unit:?}, input {bytes:?}"
+        );
+        assert_eq!(
+            *input.input.as_ref(),
+            b"<EOR>",
+            "{encoding:?}, {unit:?}, input {bytes:?}"
+        );
     }
 }
 
@@ -353,57 +475,55 @@ fn utf8_scalar_lengths_count_all_widths_and_combining_scalars() {
         ("<NAME:2>e\u{301}<NAME:3>Ray".as_bytes(), "e\u{301}"),
     ] {
         let mut input = stream(bytes, ParseEncoding::Utf8, LengthUnit::UnicodeScalars);
-        let parsed = field(&mut input).unwrap();
+        let parsed = parse_ok(field, &mut input);
         assert_eq!(parsed.raw_data, expected.as_bytes());
-        assert_eq!(parsed.text().unwrap(), expected);
+        assert_eq!(parsed.text(), expected);
         assert_eq!(*input.input.as_ref(), b"<NAME:3>Ray");
-        assert_eq!(field(&mut input).unwrap().text().unwrap(), "Ray");
+        assert_eq!(parse_ok(field, &mut input).text(), "Ray");
         assert_eq!(input.eof_offset(), 0);
     }
 }
 
 #[test]
-fn decoding_failure_preserves_the_field_and_the_following_field() {
-    for (encoding, bytes, raw) in [
+fn decoding_failures_stop_before_following_fields() {
+    for (encoding, bytes, incomplete) in [
         (
             ParseEncoding::Ascii,
             &b"<NAME:2>\xc3\xa9<NAME:3>Ray"[..],
-            &b"\xc3\xa9"[..],
+            false,
         ),
-        (
-            ParseEncoding::Ascii,
-            &b"<NAME:1>\xff<NAME:3>Ray"[..],
-            &b"\xff"[..],
-        ),
-        (
-            ParseEncoding::Utf8,
-            &b"<NAME:1>\xff<NAME:3>Ray"[..],
-            &b"\xff"[..],
-        ),
-        (
-            ParseEncoding::Utf8,
-            &b"<NAME:1>\xc3<NAME:3>Ray"[..],
-            &b"\xc3"[..],
-        ),
+        (ParseEncoding::Ascii, &b"<NAME:1>\xff<NAME:3>Ray"[..], false),
+        (ParseEncoding::Utf8, &b"<NAME:1>\xff<NAME:3>Ray"[..], false),
+        (ParseEncoding::Utf8, &b"<NAME:1>\xc3<NAME:3>Ray"[..], true),
     ] {
-        let mut input = stream(bytes, encoding, LengthUnit::Bytes);
-        let parsed = field(&mut input).unwrap();
-        assert_eq!(parsed.raw_data, raw);
-        match (encoding, parsed.text().unwrap_err()) {
-            (ParseEncoding::Ascii, DecodeError::NonAscii { offset }) => {
-                assert_eq!(*offset, 0, "first value byte is non-ASCII: {raw:?}");
+        let mut parser = Parser::new(
+            bytes,
+            ParseOpts {
+                encoding,
+                field_length: LengthUnit::Bytes,
+            },
+        );
+        let error = next_error(&mut parser);
+        assert_eq!(error.span(), 8..9);
+        match (encoding, error.kind()) {
+            (
+                ParseEncoding::Ascii,
+                error::StructuralErrorKind::Decoding {
+                    cause: DecodeError::NonAscii { offset },
+                },
+            ) => assert_eq!(*offset, 0),
+            (
+                ParseEncoding::Utf8,
+                error::StructuralErrorKind::Decoding {
+                    cause: DecodeError::Utf8(cause),
+                },
+            ) => {
+                assert_eq!(cause.valid_up_to(), 0);
+                assert_eq!(cause.error_len(), if incomplete { None } else { Some(1) });
             }
-            (ParseEncoding::Utf8, DecodeError::Utf8(error)) => {
-                assert_eq!(error.valid_up_to(), 0);
-                assert_eq!(
-                    error.error_len(),
-                    if raw == b"\xc3" { None } else { Some(1) }
-                );
-            }
-            other => panic!("wrong decoding outcome: {other:?}"),
+            other => panic!("{other:?}"),
         }
-        assert_eq!(*input.input.as_ref(), b"<NAME:3>Ray");
-        assert_eq!(field(&mut input).unwrap().text().unwrap(), "Ray");
+        assert_exhausted(&mut parser);
     }
 }
 
@@ -419,61 +539,47 @@ fn non_ascii_errors_locate_the_first_offending_byte_in_the_original_document() {
             let mut bytes = b"<CALL:3>Ray<NAME:4>".to_vec();
             bytes.extend_from_slice(raw);
             bytes.extend_from_slice(b"<QTH:3>Ann<EOR>");
-            let file = parse_file(&bytes, ParseEncoding::Ascii, unit);
-            assert_eq!(file.records.len(), 1);
-            let fields = &file.records[0].fields;
-            assert_eq!(fields.len(), 3);
-            assert_eq!(fields[0].text().unwrap(), "Ray");
-            let field = &fields[1];
-            assert_eq!(field.raw_data, raw);
-            assert_eq!(field.value_span, 19..23);
-            let error = field
-                .text()
-                .expect_err("non-ASCII text must retain a decoding error");
-            let DecodeError::NonAscii { offset } = error else {
-                panic!("expected NonAscii at value offset {expected_offset}, got {error:?}");
-            };
-            assert_eq!(
-                *offset, expected_offset,
-                "wrong first offending byte for {raw:?}, {unit:?}"
+            let mut parser = Parser::new(
+                &bytes,
+                ParseOpts {
+                    encoding: ParseEncoding::Ascii,
+                    field_length: unit,
+                },
             );
-            assert_eq!(field.value_span.start + offset, document_offset);
-            assert_eq!(bytes[document_offset], raw[expected_offset]);
-            assert_eq!(fields[2].text().unwrap(), "Ann");
+            let error = next_error(&mut parser);
+            assert_eq!(error.span(), document_offset..document_offset + 1);
+            assert!(
+                matches!(error.kind(),error::StructuralErrorKind::Decoding {
+                cause:DecodeError::NonAscii { offset }
+            } if *offset == expected_offset),
+                "unexpected value: {:?}",
+                error.kind()
+            );
+            assert_exhausted(&mut parser);
         }
     }
 }
 
 #[test]
-fn decoding_errors_remain_in_complete_records() {
-    let file = parse_file(
-        b"<NAME:1>\xff<QTH:3>Ray<EOR>",
-        ParseEncoding::Utf8,
-        LengthUnit::Bytes,
-    );
-    assert_eq!(file.records.len(), 1);
-    assert!(matches!(
-        file.records[0].fields[0].text(),
-        Err(DecodeError::Utf8(_))
-    ));
-    assert_eq!(file.records[0].fields[1].text().unwrap(), "Ray");
-}
-
-#[test]
-fn byte_lengths_can_split_a_utf8_scalar_without_losing_the_record() {
-    let mut input = stream(
+fn byte_lengths_splitting_a_utf8_scalar_fail_at_the_bounded_sequence() {
+    let mut parser = Parser::new(
         "<NAME:4>José<EOR>".as_bytes(),
-        ParseEncoding::Utf8,
-        LengthUnit::Bytes,
+        ParseOpts {
+            encoding: ParseEncoding::Utf8,
+            field_length: LengthUnit::Bytes,
+        },
     );
-    let parsed = record(&mut input).unwrap();
-    assert_eq!(parsed.fields[0].raw_data, b"Jos\xc3");
-    let Err(DecodeError::Utf8(error)) = parsed.fields[0].text() else {
-        panic!("expected incomplete scalar decoding error");
+    let error = next_error(&mut parser);
+    assert_eq!(error.span(), 11..12);
+    let error::StructuralErrorKind::Decoding {
+        cause: DecodeError::Utf8(cause),
+    } = error.kind()
+    else {
+        panic!("{error:?}")
     };
-    assert_eq!(error.valid_up_to(), 3);
-    assert_eq!(error.error_len(), None);
-    assert_eq!(input.eof_offset(), 0);
+    assert_eq!(cause.valid_up_to(), 3);
+    assert_eq!(cause.error_len(), None);
+    assert_exhausted(&mut parser);
 }
 
 #[test]
@@ -483,46 +589,58 @@ fn latin1_decoding_keeps_c1_controls_instead_of_windows_1252_mapping() {
         ParseEncoding::Latin1,
         LengthUnit::Bytes,
     );
-    let parsed = record(&mut input).unwrap();
+    let parsed = parse_ok(record, &mut input);
     assert_eq!(parsed.fields[0].raw_data, b"\x80\xe9\xff");
-    assert_eq!(parsed.fields[0].text().unwrap(), "\u{80}éÿ");
+    assert_eq!(parsed.fields[0].text(), "\u{80}éÿ");
 }
 
 #[test]
 fn ascii_decoding_does_not_enforce_printable_field_value_rules() {
     let mut input = ascii_stream(b"<COMMENT:4>\0\r\n\x7f<EOR>");
-    let parsed = record(&mut input).unwrap();
-    assert_eq!(parsed.fields[0].text().unwrap().as_bytes(), b"\0\r\n\x7f");
+    let parsed = parse_ok(record, &mut input);
+    assert_eq!(parsed.fields[0].text().as_bytes(), b"\0\r\n\x7f");
 }
 
 #[test]
-fn header_decoding_errors_preserve_raw_preamble_and_records() {
+fn header_decoding_errors_are_terminal_with_relative_causes() {
     for encoding in [ParseEncoding::Ascii, ParseEncoding::Utf8] {
-        let file = parse_file(
+        let mut parser = Parser::new(
             b"Generated \xff\n<EOH><NAME:3>Ray<EOR>",
-            encoding,
-            LengthUnit::Bytes,
+            ParseOpts {
+                encoding,
+                field_length: LengthUnit::Bytes,
+            },
         );
-        let header = file.header.unwrap();
-        assert_eq!(header.text_bytes, b"Generated \xff\n");
-        match (encoding, header.text().unwrap_err()) {
-            (ParseEncoding::Ascii, DecodeError::NonAscii { offset }) => {
-                assert_eq!(
-                    *offset, 10,
-                    "header error offset must be relative to the preamble"
-                );
-            }
-            (ParseEncoding::Utf8, DecodeError::Utf8(error)) => assert_eq!(error.valid_up_to(), 10),
-            other => panic!("wrong header decoding outcome: {other:?}"),
+        let error = next_error(&mut parser);
+        assert_eq!(error.span(), 10..11);
+        match (encoding, error.kind()) {
+            (
+                ParseEncoding::Ascii,
+                error::StructuralErrorKind::Decoding {
+                    cause: DecodeError::NonAscii { offset },
+                },
+            ) => assert_eq!(*offset, 10),
+            (
+                ParseEncoding::Utf8,
+                error::StructuralErrorKind::Decoding {
+                    cause: DecodeError::Utf8(cause),
+                },
+            ) => assert_eq!(cause.valid_up_to(), 10),
+            other => panic!("{other:?}"),
         }
-        assert_eq!(named(&file.records[0], "NAME").text().unwrap(), "Ray");
+        assert_exhausted(&mut parser);
     }
     let file = parse_file(
         b"Jos\xe9<EOH><NAME:3>Ray<EOR>",
         ParseEncoding::Latin1,
         LengthUnit::Bytes,
     );
-    assert_eq!(file.header.unwrap().text().unwrap(), "José");
+    assert_eq!(
+        file.header
+            .expect("input should yield a header because it starts with a preamble")
+            .text(),
+        "José"
+    );
 }
 
 #[test]
@@ -533,18 +651,24 @@ fn missing_eoh_at_field_boundaries_reports_the_header_terminator_at_eof() {
         &b"Generated<PROGRAMID:3>abc trailing text\r\n"[..],
         &b"Generated<PROGRAMID:0>"[..],
     ] {
-        let error = adi_file.parse(ascii_stream(bytes)).unwrap_err();
+        let error = adi_file.parse(ascii_stream(bytes)).expect_err(&format!(
+            "header should fail because this input ends before EOH: {bytes:?}"
+        ));
         assert_eq!(error.offset(), bytes.len(), "{bytes:?}");
         assert!(
             error
                 .inner()
                 .context()
-                .any(|context| matches!(context, StrContext::Label("header")))
+                .any(|context| matches!(context, StrContext::Label("header"))),
+            "input {bytes:?}: expected header context, got:\n{error}"
         );
-        assert!(error.inner().context().any(|context| matches!(
-            context,
-            StrContext::Expected(StrContextValue::StringLiteral("<EOH>"))
-        )));
+        assert!(
+            error.inner().context().any(|context| matches!(
+                context,
+                StrContext::Expected(StrContextValue::StringLiteral("<EOH>"))
+            )),
+            "input {bytes:?}: expected missing <EOH>, got:\n{error}"
+        );
     }
 }
 
@@ -555,65 +679,25 @@ fn missing_eor_at_field_boundaries_reports_the_record_terminator_at_eof() {
         &b"<NAME:3>Ray trailing text\r\n"[..],
         &b"<NAME:0>"[..],
     ] {
-        let error = adi_file.parse(ascii_stream(bytes)).unwrap_err();
+        let error = adi_file.parse(ascii_stream(bytes)).expect_err(&format!(
+            "record should fail because this input ends before EOR: {bytes:?}"
+        ));
         assert_eq!(error.offset(), bytes.len(), "{bytes:?}");
         assert!(
             error
                 .inner()
                 .context()
-                .any(|context| matches!(context, StrContext::Label("record")))
+                .any(|context| matches!(context, StrContext::Label("record"))),
+            "input {bytes:?}: expected record context, got:\n{error}"
         );
-        assert!(error.inner().context().any(|context| matches!(
-            context,
-            StrContext::Expected(StrContextValue::StringLiteral("<EOR>"))
-        )));
+        assert!(
+            error.inner().context().any(|context| matches!(
+                context,
+                StrContext::Expected(StrContextValue::StringLiteral("<EOR>"))
+            )),
+            "input {bytes:?}: expected missing <EOR>, got:\n{error}"
+        );
     }
-}
-
-fn assert_not_missing_terminator(error: &ContextError, diagnostic: &str) {
-    assert!(
-        !error.context().any(|context| matches!(
-            context,
-            StrContext::Expected(StrContextValue::StringLiteral("<EOH>" | "<EOR>"))
-        )),
-        "field error was incorrectly reported as a missing section terminator:\n{diagnostic}"
-    );
-}
-
-fn assert_truncation(
-    error: &winnow::error::ParseError<Stream<'_>, ContextError>,
-    field_name: &str,
-    declared: usize,
-    available: usize,
-    unit: LengthUnit,
-) {
-    let expected = format!(
-        "TruncatedValue for {field_name}: declared {declared} {unit:?}, \
-         available {available}; position at EOF (byte {})",
-        error.input().eof_offset(),
-    );
-    let cause = error
-        .inner()
-        .cause()
-        .and_then(|cause| cause.downcast_ref::<AdiError>());
-    assert!(
-        matches!(cause, Some(AdiError::TruncatedValue {
-            field_name: actual_name,
-            declared: actual_declared,
-            available: actual_available,
-            unit: actual_unit,
-        }) if actual_name == field_name
-            && *actual_declared == declared
-            && *actual_available == available
-            && *actual_unit == unit),
-        "expected {expected}\nactual cause: {cause:?}\nactual error:\n{error}"
-    );
-    assert_eq!(
-        error.offset(),
-        error.input().eof_offset(),
-        "expected {expected}\nactual error:\n{error}"
-    );
-    assert_not_missing_terminator(error.inner(), &error.to_string());
 }
 
 #[test]
@@ -630,7 +714,9 @@ fn byte_shortages_report_typed_counts_and_eof_in_headers_and_records() {
         ] {
             let error = adi_file
                 .parse(stream(bytes, encoding, LengthUnit::Bytes))
-                .expect_err("an unfinished field value must fail structurally");
+                .expect_err(
+                    "field should fail because its declared byte count exceeds the available bytes",
+                );
             assert_truncation(&error, field_name, declared, available, LengthUnit::Bytes);
         }
     }
@@ -641,7 +727,7 @@ fn byte_shortages_report_typed_counts_and_eof_in_headers_and_records() {
             ParseEncoding::Utf8,
             LengthUnit::Bytes,
         ))
-        .expect_err("four declared bytes cannot be satisfied by the three bytes in Ré");
+        .expect_err("field should fail because four bytes were declared but Ré supplies three");
     assert_truncation(&error, "NAME", 4, 3, LengthUnit::Bytes);
 }
 
@@ -659,7 +745,7 @@ fn scalar_shortages_report_typed_counts_and_eof_in_headers_and_records() {
         ] {
             let error = adi_file
                 .parse(stream(bytes, encoding, LengthUnit::UnicodeScalars))
-                .expect_err("an unfinished scalar-counted value must fail structurally");
+                .expect_err("field should fail because its declared scalar count exceeds the available scalars");
             assert_truncation(
                 &error,
                 field_name,
@@ -675,7 +761,7 @@ fn scalar_shortages_report_typed_counts_and_eof_in_headers_and_records() {
     ] {
         let error = adi_file
             .parse(stream(bytes, encoding, LengthUnit::UnicodeScalars))
-            .expect_err("four declared scalars cannot be satisfied by the two scalars in Ré");
+            .expect_err("field should fail because four scalars were declared but Ré supplies two");
         assert_truncation(&error, "NAME", 4, 2, LengthUnit::UnicodeScalars);
     }
 }
@@ -688,9 +774,9 @@ fn eof_guards_preserve_length_and_indicator_errors_in_headers_and_records() {
         (&b"<NAME:3:Z>Ray"[..], "data type", 8),
         (&b"Generated<PROGRAMID:3:Z>abc"[..], "data type", 22),
     ] {
-        let error = adi_file
-            .parse(ascii_stream(bytes))
-            .expect_err("a malformed length or unknown indicator must fail structurally");
+        let error = adi_file.parse(ascii_stream(bytes)).expect_err(
+            "field should fail because its length is malformed or its type indicator is unknown",
+        );
         assert_eq!(
             error.offset(),
             offset,
@@ -733,7 +819,9 @@ fn invalid_or_incomplete_utf8_reports_the_sequence_start_not_truncation_or_missi
                 ParseEncoding::Utf8,
                 LengthUnit::UnicodeScalars,
             ))
-            .expect_err("invalid or incomplete UTF-8 prevents finding a scalar boundary");
+            .expect_err(
+                "value should fail because invalid or incomplete UTF-8 prevents counting scalars",
+            );
         assert_eq!(
             error.offset(),
             offset,
@@ -746,8 +834,8 @@ fn invalid_or_incomplete_utf8_reports_the_sequence_start_not_truncation_or_missi
                 .any(|context| matches!(context, StrContext::Label("field data"))),
             "expected a field-value framing error\nactual error:\n{error}"
         );
-        // There is no typed UTF-8 structural error yet. Require an explicit
-        // expectation without tying this test to its English description.
+        // Require a UTF-8 framing expectation without coupling the test to
+        // its English description.
         assert!(
             error.inner().context().any(|context| matches!(
                 context,
@@ -774,7 +862,7 @@ fn scalar_boundary_finding_does_not_validate_later_bytes() {
         ParseEncoding::Utf8,
         LengthUnit::UnicodeScalars,
     );
-    assert_eq!(field(&mut input).unwrap().text().unwrap(), "A");
+    assert_eq!(parse_ok(field, &mut input).text(), "A");
     assert_eq!(*input.input.as_ref(), b"\xff");
 }
 
@@ -798,7 +886,7 @@ fn upstream_matir_headerless_fixture_has_one_record() {
     );
     assert!(file.header.is_none());
     assert_eq!(file.records.len(), 1);
-    assert_eq!(named(&file.records[0], "MYCALL").text().unwrap(), "KF4MDV");
+    assert_eq!(named(&file.records[0], "MYCALL").text(), "KF4MDV");
 }
 
 #[test]
@@ -809,11 +897,13 @@ fn upstream_matir_preamble_fixture_preserves_header_text() {
         LengthUnit::Bytes,
     );
     assert_eq!(
-        file.header.unwrap().text().unwrap(),
+        file.header
+            .expect("input should yield a header because it starts with a preamble")
+            .text(),
         "This is a comment at the start of the file."
     );
     assert_eq!(file.records.len(), 1);
-    assert_eq!(named(&file.records[0], "MYCALL").text().unwrap(), "KF4MDV");
+    assert_eq!(named(&file.records[0], "MYCALL").text(), "KF4MDV");
 }
 
 #[test]
@@ -823,15 +913,15 @@ fn upstream_difa_fixture_has_three_records_with_distinct_times() {
         ParseEncoding::Ascii,
         LengthUnit::Bytes,
     );
-    assert_eq!(file.header.unwrap().fields[0].text().unwrap(), "3.1.4");
+    assert_eq!(file.header.unwrap().fields[0].text(), "3.1.4");
     assert_eq!(file.records.len(), 3);
     for (record, call, time) in [
         (&file.records[0], "W1AW", "1430"),
         (&file.records[1], "AB9BH", "1445"),
         (&file.records[2], "W6RQ", "083000"),
     ] {
-        assert_eq!(named(record, "CALL").text().unwrap(), call);
-        assert_eq!(named(record, "TIME_ON").text().unwrap(), time);
+        assert_eq!(named(record, "CALL").text(), call);
+        assert_eq!(named(record, "TIME_ON").text(), time);
     }
 }
 
@@ -843,10 +933,10 @@ fn upstream_wsjtx_fixture_preserves_frequency_and_signal_report_text() {
         LengthUnit::Bytes,
     );
     assert_eq!(file.records.len(), 1);
-    assert_eq!(named(&file.records[0], "CALL").text().unwrap(), "KA9FOX");
-    assert_eq!(named(&file.records[0], "FREQ").text().unwrap(), "7.076150");
-    assert_eq!(named(&file.records[0], "RST_SENT").text().unwrap(), "-07");
-    assert_eq!(named(&file.records[0], "TIME_ON").text().unwrap(), "154515");
+    assert_eq!(named(&file.records[0], "CALL").text(), "KA9FOX");
+    assert_eq!(named(&file.records[0], "FREQ").text(), "7.076150");
+    assert_eq!(named(&file.records[0], "RST_SENT").text(), "-07");
+    assert_eq!(named(&file.records[0], "TIME_ON").text(), "154515");
 }
 
 #[test]
@@ -858,13 +948,13 @@ fn upstream_js8call_fixture_preserves_explicit_empty_values() {
     );
     assert_eq!(file.records.len(), 1);
     let record = &file.records[0];
-    assert_eq!(named(record, "CALL").text().unwrap(), "VE4DL");
-    assert_eq!(named(record, "SUBMODE").text().unwrap(), "JS8");
+    assert_eq!(named(record, "CALL").text(), "VE4DL");
+    assert_eq!(named(record, "SUBMODE").text(), "JS8");
     for name in ["GRIDSQUARE", "RST_RCVD"] {
         let field = named(record, name);
         assert_eq!(field.specifier.length, 0);
         assert_eq!(field.raw_data, b"");
-        assert_eq!(field.text().unwrap(), "");
+        assert_eq!(field.text(), "");
     }
 }
 
@@ -877,27 +967,17 @@ fn upstream_transadif_ascii_fixture_preserves_crlf_preamble_and_values() {
     );
     assert!(
         file.header
-            .unwrap()
+            .expect("input should yield a header because it starts with a preamble")
             .text_bytes
             .starts_with(b"Plain ASCII file with no encoding specified.\r\n\r\n")
     );
     assert_eq!(file.records.len(), 1);
-    assert_eq!(
-        named(&file.records[0], "NAME").text().unwrap(),
-        "John ASCII"
-    );
-    assert_eq!(named(&file.records[0], "TIME_ON").text().unwrap(), "0100");
+    assert_eq!(named(&file.records[0], "NAME").text(), "John ASCII");
+    assert_eq!(named(&file.records[0], "TIME_ON").text(), "0100");
 }
 
 // Require successful completion and exactly one record without prescribing
 // which parser consumes the fixture's separators.
-fn fixture_record(bytes: &[u8], encoding: ParseEncoding, unit: LengthUnit) -> Record<'_> {
-    let file = parse_file(bytes, encoding, unit);
-    assert!(file.header.is_some());
-    assert_eq!(file.records.len(), 1);
-    file.records.into_iter().next().unwrap()
-}
-
 #[test]
 fn upstream_latin1_fixture_uses_original_single_byte_accents() {
     let record = fixture_record(
@@ -907,7 +987,7 @@ fn upstream_latin1_fixture_uses_original_single_byte_accents() {
     );
     let name = named(&record, "NAME");
     assert_eq!(name.raw_data, b"Ju\xe1n Mu\xf1oz ISO");
-    assert_eq!(name.text().unwrap(), "Juán Muñoz ISO");
+    assert_eq!(name.text(), "Juán Muñoz ISO");
 }
 
 #[test]
@@ -919,8 +999,8 @@ fn upstream_utf8_fixture_respects_explicit_byte_or_scalar_lengths() {
     ] {
         let record = fixture_record(bytes, ParseEncoding::Utf8, unit);
         assert_eq!(named(&record, "NAME").raw_data, expected.as_bytes());
-        assert_eq!(named(&record, "NAME").text().unwrap(), expected);
-        assert_eq!(named(&record, "QSO_DATE").text().unwrap(), "20250901");
+        assert_eq!(named(&record, "NAME").text(), expected);
+        assert_eq!(named(&record, "QSO_DATE").text(), "20250901");
     }
 }
 
@@ -953,11 +1033,8 @@ fn upstream_overcount_fixture_has_utf8_bytes_despite_its_preamble_label() {
         named(&record, "NAME").raw_data,
         "Juán Muñoz Marín OVER".as_bytes()
     );
-    assert_eq!(
-        named(&record, "NAME").text().unwrap(),
-        "Juán Muñoz Marín OVER"
-    );
-    assert_eq!(named(&record, "QSO_DATE").text().unwrap(), "20250902");
+    assert_eq!(named(&record, "NAME").text(), "Juán Muñoz Marín OVER");
+    assert_eq!(named(&record, "QSO_DATE").text(), "20250902");
 }
 
 #[test]
@@ -967,16 +1044,14 @@ fn upstream_overcount_fixture_scalar_boundary_includes_the_next_open_bracket() {
         ParseEncoding::Utf8,
         LengthUnit::UnicodeScalars,
     );
-    header(&mut input).unwrap();
+    parse_ok(header, &mut input);
     // These original fixture fields precede NAME. Parse them individually so
     // we can assert the disputed boundary without requiring recovery afterward.
     for name in ["band", "call", "freq", "mode"] {
-        let parsed = terminated(field, take_till(0.., b'<'))
-            .parse_next(&mut input)
-            .unwrap();
+        let parsed = parse_ok(terminated(field, take_till(0.., b'<')), &mut input);
         assert_eq!(parsed.specifier.name, name);
     }
-    let name = field(&mut input).unwrap();
+    let name = parse_ok(field, &mut input);
     assert_eq!(name.raw_data, "Juán Muñoz Marín OVER\r\n<".as_bytes());
     assert!(input.input.as_ref().starts_with(b"qso_date:8>"));
 }
@@ -984,52 +1059,66 @@ fn upstream_overcount_fixture_scalar_boundary_includes_the_next_open_bracket() {
 #[test]
 fn upstream_missing_length_fixture_is_structurally_invalid() {
     let bytes = fixture!("matir-adifparser/testdata/header_version.adi");
-    assert!(adi_file(&mut ascii_stream(bytes)).is_err());
+    adi_file(&mut ascii_stream(bytes)).expect_err(&format!(
+        "fixture should fail because its header is unprefixed and MYCALL has no length: {bytes:?}"
+    ));
     // Also reach the missing-length descriptor directly: the whole file is
     // already invalid because it starts with '<' but later supplies EOH.
-    let missing_length = bytes.strip_prefix(b"<adif_ver:4>1.00<eoh>\n").unwrap();
+    let missing_length = bytes
+        .strip_prefix(b"<adif_ver:4>1.00<eoh>\n")
+        .expect("fixture should have the ADIF version prefix preserved in its upstream bytes");
     assert!(missing_length.starts_with(b"<mycall>"));
-    assert!(field(&mut ascii_stream(missing_length)).is_err());
+    field(&mut ascii_stream(missing_length)).expect_err(&format!(
+        "MYCALL should fail because its descriptor omits the length: {missing_length:?}"
+    ));
 }
 
 #[test]
 fn upstream_unterminated_fixture_has_two_complete_records_before_failure() {
     let bytes = fixture!("matir-adifparser/testdata/readrecord.adi");
-    assert!(adi_file(&mut ascii_stream(bytes)).is_err());
+    adi_file(&mut ascii_stream(bytes)).expect_err(&format!(
+        "fixture should fail because its final record lacks EOR: {bytes:?}"
+    ));
     let mut input = ascii_stream(bytes);
     assert_eq!(
-        named(&record(&mut input).unwrap(), "MYCALL")
-            .text()
-            .unwrap(),
+        named(&parse_ok(record, &mut input), "MYCALL").text(),
         "KF4MDV"
     );
     assert_eq!(
-        named(&record(&mut input).unwrap(), "MYCALL")
-            .text()
-            .unwrap(),
+        named(&parse_ok(record, &mut input), "MYCALL").text(),
         "KG4JEL"
     );
     assert_eq!(*input.input.as_ref(), b"<mycall:4>W1AW\n");
-    assert!(record(&mut input).is_err());
+    record(&mut input).expect_err(&format!(
+        "fixture should fail because its final record lacks EOR: {bytes:?}"
+    ));
 }
 
 #[test]
 fn public_accessors_preserve_syntactic_spans_across_records() {
     let bytes = b"skip<NAME:1>A<EOR>\r\ntext<NAME:0><EOR>\n";
     let mut input = ascii_stream(bytes);
-    let first = record(&mut input).unwrap();
-    let second = record(&mut input).unwrap();
+    let first = parse_ok(record, &mut input);
+    let second = parse_ok(record, &mut input);
     assert_eq!(first.span(), 4..18);
     assert_eq!(second.span(), 24..37);
     assert_eq!(first.fields().len(), 1);
-    let a = first.field("name").unwrap();
+    let a = first
+        .field("name")
+        .expect("section should contain NAME from the supplied descriptor");
     assert_eq!(a.name(), "NAME");
     assert_eq!(a.declared_length(), 1);
     assert_eq!(a.data_type(), None);
     assert_eq!(a.descriptor_span(), 4..12);
     assert_eq!(a.value_span(), 12..13);
     assert_eq!(&bytes[a.value_span()], a.raw_data());
-    assert_eq!(second.field("NAME").unwrap().value_span(), 32..32);
+    assert_eq!(
+        second
+            .field("NAME")
+            .expect("section should contain NAME from the supplied descriptor")
+            .value_span(),
+        32..32
+    );
 }
 
 #[test]
@@ -1049,15 +1138,22 @@ fn header_spans_use_original_bytes_and_exclude_following_separators() {
         ),
         (&b"A\xff\n<EOH>\n"[..], ParseEncoding::Ascii, 3, 8),
     ] {
-        let parsed = header(&mut stream(bytes, encoding, LengthUnit::Bytes)).unwrap();
+        if encoding == ParseEncoding::Ascii {
+            let mut parser = Parser::new(bytes, ParseOpts::default());
+            assert_eq!(next_error(&mut parser).span(), 1..2);
+            continue;
+        }
+        let parsed = parse_ok(header, &mut stream(bytes, encoding, LengthUnit::Bytes));
         assert_eq!(parsed.text_span(), 0..preamble_end);
         assert_eq!(parsed.span(), 0..section_end);
         assert_eq!(&bytes[parsed.text_span()], parsed.raw_text());
-        if encoding == ParseEncoding::Ascii {
-            assert_eq!(parsed.text(), Err(&DecodeError::NonAscii { offset: 1 }));
-        } else {
-            assert_eq!(parsed.field("programid").unwrap().text().unwrap(), "");
-        }
+        assert_eq!(
+            parsed
+                .field("programid")
+                .expect("header should contain PROGRAMID from the supplied descriptor")
+                .text(),
+            ""
+        );
     }
 }
 
@@ -1074,16 +1170,20 @@ fn duplicate_names_are_rejected_with_both_descriptor_locations() {
             if is_header {
                 document.extend_from_slice(b"P");
             }
-            document.extend_from_slice(bytes.strip_suffix(b"<EOR>").unwrap());
+            document.extend_from_slice(bytes.strip_suffix(b"<EOR>").expect(
+                "case should end with EOR because each test input supplies that terminator",
+            ));
             document.extend_from_slice(if is_header { b"<EOH>" } else { b"<EOR>" });
             let shift = usize::from(is_header);
-            let error = adi_file.parse(ascii_stream(&document)).unwrap_err();
+            let error = adi_file.parse(ascii_stream(&document)).expect_err(&format!(
+                "section should fail because NAME repeats ignoring ASCII case: {document:?}"
+            ));
             assert_eq!(error.offset(), second.start + shift);
             let cause = error
                 .inner()
                 .cause()
                 .and_then(|c| c.downcast_ref::<AdiError>())
-                .unwrap();
+                .unwrap_or_else(|| panic!("expected typed duplicate-field cause, got {error:?}"));
             let AdiError::DuplicateField {
                 first_span,
                 second_span,
@@ -1107,12 +1207,28 @@ fn duplicate_tracking_is_independent_for_each_section() {
         LengthUnit::Bytes,
     );
     assert_eq!(
-        file.header.unwrap().field("name").unwrap().text().unwrap(),
+        file.header
+            .expect("input should yield a header because it starts with a preamble")
+            .field("name")
+            .expect("section should contain NAME from the supplied descriptor")
+            .text(),
         "H"
     );
     assert_eq!(file.records.len(), 2);
-    assert_eq!(file.records[0].field("NAME").unwrap().text().unwrap(), "A");
-    assert_eq!(file.records[1].field("name").unwrap().text().unwrap(), "B");
+    assert_eq!(
+        file.records[0]
+            .field("NAME")
+            .expect("section should contain NAME from the supplied descriptor")
+            .text(),
+        "A"
+    );
+    assert_eq!(
+        file.records[1]
+            .field("name")
+            .expect("section should contain NAME from the supplied descriptor")
+            .text(),
+        "B"
+    );
 }
 
 #[test]
@@ -1133,23 +1249,31 @@ fn structural_errors_have_typed_categories_and_original_locations() {
         (&b"P<NAME:1>A"[..], SyntaxErrorKind::MissingEoh, 10..10),
     ] {
         let mut input = ascii_stream(bytes);
-        let error = adi_file(&mut input).unwrap_err();
+        let error =
+            adi_file(&mut input).expect_err(&format!("input {bytes:?} should fail with {reason:?} because it violates that syntax requirement"));
         let error = StructuralError::from_context(error, input.current_token_start(), bytes.len());
         assert_eq!(error.span(), span);
         assert!(
-            matches!(error.kind(), StructuralErrorKind::Syntax { reason: actual } if *actual == reason)
+            matches!(error.kind(), StructuralErrorKind::Syntax { reason: actual } if *actual == reason),
+            "input {bytes:?}: expected {reason:?}, got {error:?}"
         );
     }
     let bytes = format!("<NAME:{}0>", usize::MAX);
     let mut input = ascii_stream(bytes.as_bytes());
-    let context = field(&mut input).unwrap_err();
-    let error = StructuralError::from_context(context, input.current_token_start(), bytes.len());
-    assert!(matches!(
-        error.kind(),
-        StructuralErrorKind::Syntax {
-            reason: SyntaxErrorKind::LengthOverflow
-        }
+    let context = field(&mut input).expect_err(&format!(
+        "field should fail because its declared length exceeds usize::MAX: {bytes:?}"
     ));
+    let error = StructuralError::from_context(context, input.current_token_start(), bytes.len());
+    assert!(
+        matches!(
+            error.kind(),
+            StructuralErrorKind::Syntax {
+                reason: SyntaxErrorKind::LengthOverflow
+            }
+        ),
+        "unexpected value: {:?}",
+        error.kind()
+    );
     assert!(std::error::Error::source(&error).is_some());
 }
 
@@ -1162,11 +1286,16 @@ fn scalar_utf8_errors_retain_the_standard_cause_and_sequence_span() {
         (&b"<NAME:1>\xff"[..], 8..9, Some(1)),
     ] {
         let mut input = stream(bytes, ParseEncoding::Utf8, LengthUnit::UnicodeScalars);
-        let context = field(&mut input).unwrap_err();
+        let context = field(&mut input).expect_err(&format!(
+            "field should fail because its requested scalar is malformed or incomplete: {bytes:?}"
+        ));
         let error =
             StructuralError::from_context(context, input.current_token_start(), bytes.len());
         assert_eq!(error.span(), span);
-        let StructuralErrorKind::InvalidUtf8 { cause } = error.kind() else {
+        let StructuralErrorKind::Decoding {
+            cause: DecodeError::Utf8(cause),
+        } = error.kind()
+        else {
             panic!("{error:?}");
         };
         assert_eq!(cause.error_len(), error_len);
