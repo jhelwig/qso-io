@@ -42,3 +42,24 @@ pub(crate) fn parse_number(bytes: &[u8]) -> Result<BigDecimal, NumberFailure> {
             cause: Some(cause),
         })
 }
+
+#[derive(Debug, Clone)]
+pub(crate) enum NumericCause {
+    Decimal(ParseBigDecimalError),
+    Integer(bigdecimal::num_bigint::ParseBigIntError),
+}
+
+impl NumericCause {
+    pub fn boxed(self) -> Box<dyn std::error::Error + Send + Sync> {
+        match self {
+            Self::Decimal(error) => Box::new(error),
+            Self::Integer(error) => Box::new(error),
+        }
+    }
+}
+
+impl From<ParseBigDecimalError> for NumericCause {
+    fn from(value: ParseBigDecimalError) -> Self {
+        Self::Decimal(value)
+    }
+}

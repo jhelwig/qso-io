@@ -1,5 +1,6 @@
 use std::mem;
 
+use bigdecimal::num_bigint::BigInt;
 use chrono::{NaiveDate, NaiveTime};
 
 use super::*;
@@ -7,6 +8,26 @@ use crate::adif::{
     AdifLocation, AdifTime, Hemisphere, TimePrecision, Value, ValueError, number::parse_number,
     text::check_text,
 };
+
+mod identifiers;
+
+#[derive(Debug, Clone)]
+pub(super) struct ValueFailure {
+    pub cause: ValueError,
+    pub span: Range<usize>,
+}
+
+pub(super) fn source_range(
+    text: &str,
+    range: Range<usize>,
+    encoding: ParseEncoding,
+) -> Range<usize> {
+    if encoding == ParseEncoding::Latin1 {
+        text[..range.start].chars().count()..text[..range.end].chars().count()
+    } else {
+        range
+    }
+}
 
 fn digits(bytes: &[u8], start: usize, end: usize) -> std::result::Result<u32, Range<usize>> {
     let component = &bytes[start.min(bytes.len())..end.min(bytes.len())];
@@ -85,9 +106,52 @@ pub(super) fn parse<'a>(
 
                 Value::Boolean(value)
             }
-            Some(DataType::Number) => Value::Number(
-                parse_number(raw).map_err(|e| fail(ValueError::InvalidNumber, e.span, e.cause))?,
-            ),
+            Some(kind @ (DataType::Integer | DataType::PositiveInteger)) => {
+                let reason = if kind == DataType::Integer {
+                    ValueError::InvalidInteger
+                } else {
+                    ValueError::InvalidPositiveInteger
+                };
+                for (index, byte) in raw.iter().enumerate() {
+                    if !byte.is_ascii_digit()
+                        && !(kind == DataType::Integer && index == 0 && *byte == b'-')
+                    {
+                        return Err(fail(reason, index..index + 1, None));
+                    }
+                }
+                if raw == b"-" {
+                    return Err(fail(reason, raw.len()..raw.len(), None));
+                }
+                let spelling = str::from_utf8(raw).expect("integer should be UTF-8 because all bytes were checked as ASCII digits or an initial minus");
+                let integer: BigInt = spelling.parse().map_err(|cause| {
+                    fail(
+                        reason,
+                        0..raw.len(),
+                        Some(crate::adif::number::NumericCause::Integer(cause)),
+                    )
+                })?;
+                if kind == DataType::PositiveInteger && integer <= BigInt::default() {
+                    return Err(fail(reason, 0..raw.len(), None));
+                }
+                Value::Integer(integer)
+            }
+            Some(
+                kind @ (DataType::GridSquare
+                | DataType::GridSquareExt
+                | DataType::IOTARefNo
+                | DataType::POTARef
+                | DataType::SOTARef
+                | DataType::WWFFRef),
+            ) => {
+                identifiers::check(kind, &text, raw, input.state.parser_options.encoding)
+                    .map_err(|e| fail(e.cause, e.span, None))?;
+                Value::Text(mem::take(&mut text))
+            }
+            Some(DataType::Number) => {
+                Value::Number(parse_number(raw).map_err(|e| {
+                    fail(ValueError::InvalidNumber, e.span, e.cause.map(Into::into))
+                })?)
+            }
             Some(DataType::Date) => {
                 let reason = ValueError::InvalidDate;
 
@@ -171,8 +235,13 @@ pub(super) fn parse<'a>(
                     return Err(fail(reason, 5..11, None));
                 }
 
-                let minutes = parse_number(&raw[5..11])
-                    .map_err(|e| fail(reason, 5 + e.span.start..5 + e.span.end, e.cause))?;
+                let minutes = parse_number(&raw[5..11]).map_err(|e| {
+                    fail(
+                        reason,
+                        5 + e.span.start..5 + e.span.end,
+                        e.cause.map(Into::into),
+                    )
+                })?;
 
                 Value::Location(AdifLocation {
                     hemisphere,

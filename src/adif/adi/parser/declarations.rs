@@ -88,7 +88,7 @@ pub(super) fn parse<'a>(input: &Stream<'a>, framed: FramedField<'a>) -> Result<U
                             field_name: framed.specifier.name.to_string(),
                             span: offset + error.span.start..offset + error.span.end,
                             cause: UserDefinitionError::InvalidRangeBound,
-                            numeric_cause: error.cause,
+                            numeric_cause: error.cause.map(Into::into),
                         },
                     )
                 })

@@ -493,6 +493,7 @@ fn composite_values_and_definitions_outlive_the_parser() {
                 assert!(*b);
                 "boolean"
             }
+            Value::Integer(_) => "integer",
             Value::Number(n) => {
                 assert_eq!(n, &bigdecimal::BigDecimal::from(1));
                 "number"

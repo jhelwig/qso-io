@@ -149,7 +149,7 @@ impl StructuralError {
                     } => (
                         StructuralErrorKind::InvalidValue { field_name, cause },
                         span,
-                        numeric_cause.map(|e| Box::new(e) as _),
+                        numeric_cause.map(crate::adif::number::NumericCause::boxed),
                     ),
                     AdiError::InvalidUserDefinition {
                         field_name,
@@ -159,7 +159,7 @@ impl StructuralError {
                     } => (
                         StructuralErrorKind::InvalidUserDefinition { field_name, cause },
                         span,
-                        numeric_cause.map(|e| Box::new(e) as _),
+                        numeric_cause.map(crate::adif::number::NumericCause::boxed),
                     ),
                     AdiError::TypeUnavailableInAdi { data_type, span } => (
                         StructuralErrorKind::TypeUnavailableInAdi { data_type },
@@ -334,14 +334,14 @@ pub(super) enum AdiError {
         field_name: String,
         span: Range<usize>,
         cause: ValueError,
-        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+        numeric_cause: Option<crate::adif::number::NumericCause>,
     },
     #[error("invalid declaration {field_name}: {cause}")]
     InvalidUserDefinition {
         field_name: String,
         span: Range<usize>,
         cause: UserDefinitionError,
-        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+        numeric_cause: Option<crate::adif::number::NumericCause>,
     },
     #[error("type {data_type:?} is unavailable in ADI")]
     TypeUnavailableInAdi {

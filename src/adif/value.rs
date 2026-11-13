@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, num_bigint::BigInt};
 use chrono::{NaiveDate, NaiveTime};
 use thiserror::Error;
 
@@ -14,6 +14,8 @@ pub enum Value<'a> {
     Text(Cow<'a, str>),
     /// ADIF Y/y or N/n parsed as a Boolean.
     Boolean(bool),
+    /// An exact Integer or PositiveInteger value.
+    Integer(BigInt),
     /// An exact ADIF decimal Number.
     Number(BigDecimal),
     /// A valid ADIF calendar date expressing a UTC date component.
@@ -93,6 +95,31 @@ pub enum Hemisphere {
 /// The declared ADIF type whose value grammar failed.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ValueError {
+    /// Invalid signed ASCII integer grammar.
+    #[error("invalid Integer")]
+    InvalidInteger,
+    /// Invalid unsigned integer grammar or a value not greater than zero.
+    #[error("invalid PositiveInteger")]
+    InvalidPositiveInteger,
+    /// Invalid Maidenhead locator.
+    #[error("invalid GridSquare")]
+    InvalidGridSquare,
+    /// Invalid additional Maidenhead locator pairs.
+    #[error("invalid GridSquareExt")]
+    InvalidGridSquareExt,
+    /// Invalid continent or island-group reference.
+    #[error("invalid IOTARefNo")]
+    InvalidIOTARefNo,
+    /// Invalid POTA reference format.
+    #[error("invalid POTARef")]
+    InvalidPOTARef,
+    /// Invalid SOTA text repertoire or missing slash/component.
+    #[error("invalid SOTARef")]
+    InvalidSOTARef,
+    /// Invalid WWFF reference format.
+    #[error("invalid WWFFRef")]
+    InvalidWWFFRef,
+
     /// Invalid Boolean spelling.
     #[error("invalid Boolean")]
     InvalidBoolean,

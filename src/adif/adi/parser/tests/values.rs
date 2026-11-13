@@ -46,6 +46,17 @@ fn failure(raw: &[u8], kind: char, reason: ValueError, relative: Range<usize>) {
     assert_exhausted(&mut parser);
 }
 
+fn resolved_value<'a>(
+    bytes: &'a [u8],
+    kind: DataType,
+) -> std::result::Result<Field<'a>, StructuralError> {
+    let mut input = ascii_stream(bytes);
+    let framed = parse_ok(framed_field, &mut input);
+    crate::adif::adi::parser::values::parse(&input, framed, Some(kind)).map_err(|error| {
+        StructuralError::from_context(error, input.current_token_start(), bytes.len())
+    })
+}
+
 #[test]
 fn invalid_declared_values_are_terminal() {
     for bytes in [
@@ -428,5 +439,133 @@ fn numeric_grammars_remain_ascii_in_utf8_mode() {
                 "input {text:?}, type {kind}, unit {unit:?}: expected {reason:?}, got {error:?}"
             );
         }
+    }
+}
+
+#[test]
+fn integer_types_preserve_magnitude_and_spelling() {
+    for (kind, text, expected) in [
+        (DataType::Integer, "-000123", "-123"),
+        (
+            DataType::Integer,
+            "1234567890123456789012345678901234567890",
+            "1234567890123456789012345678901234567890",
+        ),
+        (DataType::PositiveInteger, "0001", "1"),
+    ] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let field =
+            resolved_value(&bytes, kind).unwrap_or_else(|e| panic!("{kind:?} {text:?}: {e}"));
+        assert!(
+            matches!(field.value(), Some(Value::Integer(n)) if n.to_string() == expected),
+            "{field:?}"
+        );
+        assert_eq!(field.text(), text);
+    }
+    for (text, relative) in [("0", 0..1), ("-1", 0..1), ("+1", 0..1), ("1.0", 1..2)] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let error = resolved_value(&bytes, DataType::PositiveInteger)
+            .expect_err("invalid PositiveInteger should fail");
+        assert_eq!(
+            error.span(),
+            5 + relative.start..5 + relative.end,
+            "{text}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn identifier_types_enforce_only_the_defined_grammar() {
+    for (kind, text) in [
+        (DataType::GridSquare, "FN01mh42"),
+        (DataType::GridSquareExt, "BQ12"),
+        (DataType::IOTARefNo, "EU-001"),
+        (DataType::POTARef, "K-4562@US-CA"),
+        (DataType::WWFFRef, "3DAFF-0002"),
+    ] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let field = resolved_value(&bytes, kind).unwrap_or_else(|e| panic!("{kind:?} {text}: {e}"));
+        assert!(
+            matches!(field.value(), Some(Value::Text(t)) if t == text),
+            "{field:?}"
+        );
+        assert_eq!(field.data_type(), Some(kind));
+    }
+    for (kind, text, relative) in [
+        (DataType::GridSquare, "SN01", 0..1),
+        (DataType::GridSquareExt, "BZ", 1..2),
+        (DataType::IOTARefNo, "EU-000", 3..6),
+        (DataType::WWFFRef, "KFF-00a1", 6..7),
+        (DataType::POTARef, "K-12x4", 4..5),
+    ] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let start = bytes
+            .iter()
+            .position(|b| *b == b'>')
+            .expect("test descriptor should contain >")
+            + 1;
+        let error = resolved_value(&bytes, kind).expect_err("invalid reference should fail");
+        assert!(
+            matches!(
+                error.kind(),
+                error::StructuralErrorKind::InvalidValue { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.span(),
+            start + relative.start..start + relative.end,
+            "{kind:?} {text}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn sota_checks_do_not_invent_a_reference_number_grammar() {
+    for text in ["G/LD-3", "A/Anything"] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let field =
+            resolved_value(&bytes, DataType::SOTARef).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(field.text(), text);
+    }
+    for (text, relative) in [("G", 1..1), ("G/", 2..2), ("/G", 0..0)] {
+        let bytes = document(
+            text.as_bytes(),
+            None,
+            ParseEncoding::Ascii,
+            LengthUnit::Bytes,
+        );
+        let error = resolved_value(&bytes, DataType::SOTARef)
+            .expect_err("missing SOTA component should fail");
+        assert_eq!(
+            error.span(),
+            5 + relative.start..5 + relative.end,
+            "{text}: {error:?}"
+        );
     }
 }
