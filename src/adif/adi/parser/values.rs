@@ -10,10 +10,12 @@ use crate::adif::{
 };
 
 mod identifiers;
+mod lists;
 
 #[derive(Debug, Clone)]
 pub(super) struct ValueFailure {
     pub cause: ValueError,
+    pub enumeration: Option<&'static str>,
     pub span: Range<usize>,
 }
 
@@ -70,6 +72,7 @@ pub(super) fn parse<'a>(
                 cause,
                 span: f.value_span.start + span.start..f.value_span.start + span.end,
                 numeric_cause,
+                enumeration: None,
             },
         )
     };
@@ -143,9 +146,53 @@ pub(super) fn parse<'a>(
                 | DataType::SOTARef
                 | DataType::WWFFRef),
             ) => {
-                identifiers::check(kind, &text, raw, input.state.parser_options.encoding)
-                    .map_err(|e| fail(e.cause, e.span, None))?;
+                identifiers::check(kind, &text, raw, input.state.parser_options.encoding).map_err(
+                    |error| {
+                        ContextError::from_external_error(
+                            input,
+                            AdiError::InvalidValue {
+                                field_name: f.specifier.name.to_string(),
+                                cause: error.cause,
+                                span: f.value_span.start + error.span.start
+                                    ..f.value_span.start + error.span.end,
+                                numeric_cause: None,
+                                enumeration: error.enumeration,
+                            },
+                        )
+                    },
+                )?;
                 Value::Text(mem::take(&mut text))
+            }
+            Some(
+                kind @ (DataType::AwardList
+                | DataType::CreditList
+                | DataType::SponsoredAwardList
+                | DataType::GridSquareList
+                | DataType::POTARefList
+                | DataType::SecondarySubdivisionList
+                | DataType::SecondaryAdministrativeSubdivisionListAlt),
+            ) => {
+                let (members, whole) = lists::parse(
+                    kind,
+                    mem::take(&mut text),
+                    raw,
+                    input.state.parser_options.encoding,
+                )
+                .map_err(|error| {
+                    ContextError::from_external_error(
+                        input,
+                        AdiError::InvalidValue {
+                            field_name: f.specifier.name.to_string(),
+                            cause: error.cause,
+                            span: f.value_span.start + error.span.start
+                                ..f.value_span.start + error.span.end,
+                            numeric_cause: None,
+                            enumeration: error.enumeration,
+                        },
+                    )
+                })?;
+                text = whole;
+                Value::List(members)
             }
             Some(DataType::Number) => {
                 Value::Number(parse_number(raw).map_err(|e| {

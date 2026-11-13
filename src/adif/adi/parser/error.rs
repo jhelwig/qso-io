@@ -62,6 +62,8 @@ pub enum StructuralErrorKind {
         field_name: String,
         /// Declared type whose grammar failed.
         cause: ValueError,
+        /// Expected standard enumeration when membership failed.
+        enumeration: Option<&'static str>,
     },
     /// A USERDEFn declaration failed its own grammar or range requirements.
     InvalidUserDefinition {
@@ -146,8 +148,13 @@ impl StructuralError {
                         span,
                         cause,
                         numeric_cause,
+                        enumeration,
                     } => (
-                        StructuralErrorKind::InvalidValue { field_name, cause },
+                        StructuralErrorKind::InvalidValue {
+                            field_name,
+                            cause,
+                            enumeration,
+                        },
                         span,
                         numeric_cause.map(crate::adif::number::NumericCause::boxed),
                     ),
@@ -278,7 +285,9 @@ impl fmt::Display for StructuralError {
                 "duplicate field {field_name}; first descriptor at bytes {}..{}",
                 first_span.start, first_span.end
             ),
-            StructuralErrorKind::InvalidValue { field_name, cause } => {
+            StructuralErrorKind::InvalidValue {
+                field_name, cause, ..
+            } => {
                 write!(f, "invalid value for {field_name}: {cause}")
             }
             StructuralErrorKind::InvalidUserDefinition { field_name, cause } => {
@@ -335,6 +344,7 @@ pub(super) enum AdiError {
         span: Range<usize>,
         cause: ValueError,
         numeric_cause: Option<crate::adif::number::NumericCause>,
+        enumeration: Option<&'static str>,
     },
     #[error("invalid declaration {field_name}: {cause}")]
     InvalidUserDefinition {

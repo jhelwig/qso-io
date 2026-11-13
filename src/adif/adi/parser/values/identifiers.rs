@@ -18,10 +18,15 @@ pub(super) fn check(
     };
     let fail = |range| ValueFailure {
         cause,
+        enumeration: None,
         span: source_range(text, range, encoding),
     };
 
-    check_text(raw, encoding, false).map_err(|span| ValueFailure { cause, span })?;
+    check_text(raw, encoding, false).map_err(|span| ValueFailure {
+        cause,
+        enumeration: None,
+        span,
+    })?;
 
     match kind {
         DataType::GridSquare | DataType::GridSquareExt => {
@@ -37,6 +42,7 @@ pub(super) fn check(
                 if !valid {
                     return Err(ValueFailure {
                         cause,
+                        enumeration: None,
                         span: index..index + 1,
                     });
                 }
@@ -49,6 +55,7 @@ pub(super) fn check(
             if !valid_width {
                 return Err(ValueFailure {
                     cause,
+                    enumeration: None,
                     span: raw.len()..raw.len(),
                 });
             }
@@ -57,15 +64,19 @@ pub(super) fn check(
             if raw.len() < 2 {
                 return Err(fail(text.len()..text.len()));
             }
-            if !["AF", "AN", "AS", "EU", "NA", "OC", "SA"]
-                .iter()
-                .any(|code| raw[..2].eq_ignore_ascii_case(code.as_bytes()))
+            if !std::str::from_utf8(&raw[..2])
+                .is_ok_and(|prefix| crate::adif::Enumeration::Continent.contains(prefix))
             {
-                return Err(ValueFailure { cause, span: 0..2 });
+                return Err(ValueFailure {
+                    cause,
+                    enumeration: Some("Continent"),
+                    span: 0..2,
+                });
             }
             if raw.get(2) != Some(&b'-') {
                 return Err(ValueFailure {
                     cause,
+                    enumeration: None,
                     span: 2.min(raw.len())..3.min(raw.len()),
                 });
             }
@@ -73,6 +84,7 @@ pub(super) fn check(
                 if !byte.is_ascii_digit() || index >= 6 {
                     return Err(ValueFailure {
                         cause,
+                        enumeration: None,
                         span: index..index + 1,
                     });
                 }
@@ -81,7 +93,11 @@ pub(super) fn check(
                 return Err(fail(text.len()..text.len()));
             }
             if &raw[3..] == b"000" {
-                return Err(ValueFailure { cause, span: 3..6 });
+                return Err(ValueFailure {
+                    cause,
+                    enumeration: None,
+                    span: 3..6,
+                });
             }
         }
         DataType::SOTARef => {

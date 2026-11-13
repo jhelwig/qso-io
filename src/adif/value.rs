@@ -12,6 +12,8 @@ use thiserror::Error;
 pub enum Value<'a> {
     /// Original decoded text, retaining its spelling.
     Text(Cow<'a, str>),
+    /// Top-level list members in source order, retaining compound member spelling.
+    List(Vec<Cow<'a, str>>),
     /// ADIF Y/y or N/n parsed as a Boolean.
     Boolean(bool),
     /// An exact Integer or PositiveInteger value.
@@ -95,6 +97,28 @@ pub enum Hemisphere {
 /// The declared ADIF type whose value grammar failed.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ValueError {
+    /// Invalid AwardList grammar, cardinality, or applicable membership.
+    #[error("invalid AwardList")]
+    InvalidAwardList,
+    /// Invalid CreditList grammar, cardinality, or applicable membership.
+    #[error("invalid CreditList")]
+    InvalidCreditList,
+    /// Invalid SponsoredAwardList grammar, cardinality, or applicable membership.
+    #[error("invalid SponsoredAwardList")]
+    InvalidSponsoredAwardList,
+    /// Invalid GridSquareList grammar, cardinality, or applicable membership.
+    #[error("invalid GridSquareList")]
+    InvalidGridSquareList,
+    /// Invalid POTARefList grammar, cardinality, or applicable membership.
+    #[error("invalid POTARefList")]
+    InvalidPOTARefList,
+    /// Invalid SecondarySubdivisionList grammar, cardinality, or applicable membership.
+    #[error("invalid SecondarySubdivisionList")]
+    InvalidSecondarySubdivisionList,
+    /// Invalid SecondaryAdministrativeSubdivisionListAlt grammar, cardinality, or applicable membership.
+    #[error("invalid SecondaryAdministrativeSubdivisionListAlt")]
+    InvalidSecondaryAdministrativeSubdivisionListAlt,
+
     /// Invalid signed ASCII integer grammar.
     #[error("invalid Integer")]
     InvalidInteger,

@@ -5,7 +5,9 @@
 //! headers and records. Structural errors, including text-decoding failures,
 //! terminate iteration while leaving previously yielded sections available.
 //!
-//! Reference enums describe ADIF value categories and enumeration members.
+//! [`StandardField`] describes standard field definitions. Reference types such
+//! as [`AntPath`], [`ArrlSection`], [`Band`] and [`DxccEntity`] describe enumeration
+//! identities and their metadata; parser membership checks use these same types.
 //!
 //! # Declared values
 //!
@@ -90,15 +92,25 @@
 
 use std::{borrow::Cow, ops::Range, str::Utf8Error};
 
-use chrono::NaiveDate;
 use thiserror::Error;
 
+pub use enumerations::primary as primary_subdivisions;
+pub use enumerations::{
+    AlaskaCounty, AntPath, ArrlSection, Award, AwardSponsor, Band, ContestId, Continent, Credit,
+    DxccEntity, Enumeration, EqslAg, Mode, MorseKeyType, NzRegionDistrict, PropagationMode,
+    QslMedium, QslRcvd, QslSent, QslVia, QsoComplete, QsoDownloadStatus, QsoUploadStatus, Region,
+    SecondarySubdivision, SecondarySubdivisionAlt, Submode,
+};
+pub use standard_field::{FieldSection, StandardField};
 pub use value::{AdifLocation, AdifTime, Hemisphere, TimePrecision, Value, ValueError};
 
 /// Borrowed ADI sections, their parser, and structural diagnostics.
 pub mod adi;
+mod catalog;
+mod enumerations;
 mod number;
 mod parser;
+mod standard_field;
 mod text;
 mod value;
 
@@ -475,152 +487,4 @@ impl TryFrom<&str> for DataType {
             u => Err(DataTypeError::UnknownTypeSpecifier(u.to_owned())),
         }
     }
-}
-
-/// ADIF antenna-path codes describing how the signal propagated.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum AntPath {
-    /// Grayline
-    G,
-    /// Other
-    O,
-    /// Short path
-    S,
-    /// Long path
-    L,
-}
-
-/// A partial reference list of ARRL section identifiers and their metadata.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum ArrlSection {
-    /// Alabama.
-    AL,
-    /// Alaska.
-    AK,
-    /// Alberta.
-    AB,
-    /// Arkansas.
-    AR,
-    /// Arizona.
-    AZ,
-    /// British Columbia.
-    BC,
-    /// Colorado.
-    CO,
-}
-
-impl ArrlSection {
-    /// Returns the human-readable section name.
-    pub fn name(self) -> &'static str {
-        match self {
-            ArrlSection::AL => "Alabama",
-            ArrlSection::AK => "Alaska",
-            ArrlSection::AB => "Alberta",
-            ArrlSection::AR => "Arkansas",
-            ArrlSection::AZ => "Arizona",
-            ArrlSection::BC => "British Columbia",
-            ArrlSection::CO => "Colorado",
-        }
-    }
-
-    /// Returns the associated ADIF DXCC entity code.
-    pub fn dxcc_entity_code(self) -> u16 {
-        match self {
-            ArrlSection::AL | ArrlSection::AR | ArrlSection::AZ | ArrlSection::CO => 291,
-            ArrlSection::AK => 6,
-            ArrlSection::AB => 1,
-            ArrlSection::BC => 1,
-        }
-    }
-
-    /// Returns the section's From Date from the ADIF enumeration, or `None`
-    /// when the specification leaves it unspecified.
-    pub fn from_date(self) -> Option<NaiveDate> {
-        match self {
-            ArrlSection::AL
-            | ArrlSection::AK
-            | ArrlSection::AB
-            | ArrlSection::AR
-            | ArrlSection::AZ
-            | ArrlSection::BC
-            | ArrlSection::CO => None,
-        }
-    }
-
-    /// Returns the section's Deleted Date from the ADIF enumeration, or `None`
-    /// when the specification leaves it unspecified.
-    pub fn deleted_date(self) -> Option<NaiveDate> {
-        match self {
-            ArrlSection::AL
-            | ArrlSection::AK
-            | ArrlSection::AB
-            | ArrlSection::AR
-            | ArrlSection::AZ
-            | ArrlSection::BC
-            | ArrlSection::CO => None,
-        }
-    }
-}
-
-/// Award identifiers from ADIF's import-only Award enumeration.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum Award {
-    /// ADIF `AJA` identifier (import-only).
-    Aja,
-    /// ADIF `CQDX` identifier (import-only).
-    Cqdx,
-    /// ADIF `CQDXFIELD` identifier (import-only).
-    Cqdxfield,
-    /// ADIF `CQWAZ_MIXED` identifier (import-only).
-    CqwazMixed,
-    /// ADIF `CQWAZ_CW` identifier (import-only).
-    CqwazCw,
-    /// ADIF `CQWAZ_PHONE` identifier (import-only).
-    CqwazPhone,
-    /// ADIF `CQWAZ_RTTY` identifier (import-only).
-    CqwazRtty,
-    /// ADIF `CQWAZ_160m` identifier (import-only).
-    Cqwaz160m,
-    /// ADIF `CQWPX` identifier (import-only).
-    Cqwpx,
-    /// ADIF `DARC_DOK` identifier (import-only).
-    DarcDok,
-    /// ADIF `DXCC` identifier (import-only).
-    Dxcc,
-    /// ADIF `DXCC_MIXED` identifier (import-only).
-    DxccMixed,
-    /// ADIF `DXCC_CW` identifier (import-only).
-    DxccCw,
-    /// ADIF `DXCC_PHONE` identifier (import-only).
-    DxccPhone,
-    /// ADIF `DXCC_RTTY` identifier (import-only).
-    DxccRtty,
-    /// ADIF `IOTA` identifier (import-only).
-    Iota,
-    /// ADIF `JCC` identifier (import-only).
-    Jcc,
-    /// ADIF `JCG` identifier (import-only).
-    Jcg,
-    /// ADIF `MARATHON` identifier (import-only).
-    Marathon,
-    /// ADIF `RDA` identifier (import-only).
-    Rda,
-    /// ADIF `WAB` identifier (import-only).
-    Wab,
-    /// ADIF `WAC` identifier (import-only).
-    Wac,
-    /// ADIF `WAE` identifier (import-only).
-    Wae,
-    /// ADIF `WAIP` identifier (import-only).
-    Waip,
-    /// ADIF `WAJA` identifier (import-only).
-    Waja,
-    /// ADIF `WAS` identifier (import-only).
-    Was,
-    /// ADIF `WAZ` identifier (import-only).
-    Waz,
-    /// ADIF `USACA` identifier (import-only).
-    Usaca,
-    /// ADIF `VUCC` identifier (import-only).
-    Vucc,
 }

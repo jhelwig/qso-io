@@ -9,6 +9,7 @@ use super::*;
 
 mod declarations;
 mod decoding;
+mod lists;
 mod values;
 
 #[track_caller]
