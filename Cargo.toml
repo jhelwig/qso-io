@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 bigdecimal = "0.4.11"
 bstr = "1.13.1"
+caseless = "0.2.2"
 chrono = "0.4.45"
 encoding_rs = "0.8.44"
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
 winnow = "1.0.5"

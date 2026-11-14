@@ -9,7 +9,6 @@ use crate::adif::{
 
 /// The syntactic requirement that an ADI input failed to satisfy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SyntaxErrorKind {
     /// A field descriptor is incomplete or does not match the ADI syntax.
     MalformedDescriptor,
@@ -27,10 +26,47 @@ pub enum SyntaxErrorKind {
     InvalidNameEncoding,
 }
 
-/// Structured details of a terminal ADI parsing failure.
-#[derive(Debug)]
-#[non_exhaustive]
+/// The kind of an ADI parsing error.
+#[derive(Debug, Clone)]
 pub enum StructuralErrorKind {
+    /// Two USERDEF declarations name the same record field ignoring ASCII case.
+    DuplicateUserDefinition {
+        /// Original repeated target name.
+        field_name: String,
+        /// First target name's original byte range.
+        first_span: Range<usize>,
+        /// Second target name's range and primary failure location.
+        second_span: Range<usize>,
+    },
+    /// A nonempty value violates a document USERDEF constraint.
+    UserDefinitionConstraintViolation {
+        /// Original record-field name.
+        field_name: String,
+        /// Descriptor establishing the user field.
+        declaration_span: Range<usize>,
+        /// Original constraint envelope, including braces.
+        constraint_span: Range<usize>,
+        /// Constraint-specific reason, retaining exact bounds when relevant.
+        cause: crate::adif::adi::UserDefinitionValueError,
+    },
+    /// An inline indicator conflicts with the field's defined type.
+    TypeConflict {
+        /// Original field name.
+        field_name: String,
+        /// Types permitted by the definition, including types with no indicator.
+        expected: Vec<DataType>,
+        /// Type named by the supplied inline indicator.
+        supplied: DataType,
+        /// USERDEF declaration or first application descriptor establishing type.
+        definition_span: Option<Range<usize>>,
+    },
+    /// No permitted standard type accepts the supplied value.
+    NoMatchingType {
+        /// Original field name.
+        field_name: String,
+        /// Failures in preference order; the first supplies the primary span.
+        failures: Vec<TypeAlternativeFailure>,
+    },
     /// Malformed syntax or a required section terminator missing at EOF.
     Syntax {
         /// The specific syntactic requirement that was not satisfied.
@@ -56,21 +92,23 @@ pub enum StructuralErrorKind {
         /// Repeated descriptor's original byte range and primary error location.
         second_span: Range<usize>,
     },
-    /// Nonempty field contents fail their explicit ADIF type grammar.
+    /// Nonempty contents fail their resolved ADIF type grammar or membership.
     InvalidValue {
         /// Original field name.
         field_name: String,
         /// Declared type whose grammar failed.
         cause: ValueError,
+        /// Expected standard enumeration when membership failed.
+        enumeration: Option<&'static str>,
     },
-    /// A USERDEFn declaration failed its own grammar or range requirements.
+    /// An invalid USERDEF declaration.
     InvalidUserDefinition {
         /// Original descriptor name.
         field_name: String,
         /// Declaration-specific reason.
         cause: UserDefinitionError,
     },
-    /// A recognized type indicator is unavailable in ADI.
+    /// An ADIF data type is unavailable in ADI.
     TypeUnavailableInAdi {
         /// Recognized ADIF data type.
         data_type: DataType,
@@ -82,15 +120,47 @@ pub enum StructuralErrorKind {
     },
 }
 
+/// A failed value conversion for one permitted standard field type.
+#[derive(Debug, Clone)]
+pub struct TypeAlternativeFailure {
+    pub(super) data_type: DataType,
+    pub(super) span: Range<usize>,
+    pub(super) cause: ValueError,
+    pub(super) enumeration: Option<&'static str>,
+}
+
+impl TypeAlternativeFailure {
+    /// Returns the attempted ADIF type.
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    /// Returns the failure's original input byte range.
+    pub fn span(&self) -> Range<usize> {
+        self.span.clone()
+    }
+
+    /// Borrows the type-specific failure reason.
+    pub fn cause(&self) -> &ValueError {
+        &self.cause
+    }
+
+    /// Returns the expected standard enumeration, when membership failed.
+    ///
+    /// The static label can be retained independently of this failure.
+    pub fn enumeration(&self) -> Option<&'static str> {
+        self.enumeration
+    }
+}
+
 /// A structural error located in the original input byte slice.
 ///
 /// Spans have exclusive ends. Truncated values and missing terminators have an
 /// empty span at input length; invalid bounded values can point inside the input.
-/// Display reports the byte range and error details.
 #[derive(Debug)]
 pub struct StructuralError {
     span: Range<usize>,
-    kind: StructuralErrorKind,
+    kind: Box<StructuralErrorKind>,
     cause: Option<Box<dyn StdError + Send + Sync>>,
 }
 
@@ -103,7 +173,7 @@ impl StructuralError {
         self.span.clone()
     }
 
-    /// Borrows structured details independently of the formatted message.
+    /// Returns the error kind.
     pub fn kind(&self) -> &StructuralErrorKind {
         &self.kind
     }
@@ -113,6 +183,15 @@ impl StructuralError {
         if let Some(cause) = error.cause().and_then(|e| e.downcast_ref::<AdiError>()) {
             let (kind, span, source): (_, _, Option<Box<dyn StdError + Send + Sync>>) =
                 match cause.clone() {
+                    AdiError::Defined {
+                        kind,
+                        span,
+                        numeric_cause,
+                    } => (
+                        *kind,
+                        span,
+                        numeric_cause.map(crate::adif::number::NumericCause::boxed),
+                    ),
                     AdiError::TruncatedValue {
                         field_name,
                         declared,
@@ -146,10 +225,15 @@ impl StructuralError {
                         span,
                         cause,
                         numeric_cause,
+                        enumeration,
                     } => (
-                        StructuralErrorKind::InvalidValue { field_name, cause },
+                        StructuralErrorKind::InvalidValue {
+                            field_name,
+                            cause,
+                            enumeration,
+                        },
                         span,
-                        numeric_cause.map(|e| Box::new(e) as _),
+                        numeric_cause.map(crate::adif::number::NumericCause::boxed),
                     ),
                     AdiError::InvalidUserDefinition {
                         field_name,
@@ -159,7 +243,7 @@ impl StructuralError {
                     } => (
                         StructuralErrorKind::InvalidUserDefinition { field_name, cause },
                         span,
-                        numeric_cause.map(|e| Box::new(e) as _),
+                        numeric_cause.map(crate::adif::number::NumericCause::boxed),
                     ),
                     AdiError::TypeUnavailableInAdi { data_type, span } => (
                         StructuralErrorKind::TypeUnavailableInAdi { data_type },
@@ -181,7 +265,7 @@ impl StructuralError {
                 };
             return Self {
                 span,
-                kind,
+                kind: Box::new(kind),
                 cause: source,
             };
         }
@@ -191,9 +275,9 @@ impl StructuralError {
         {
             return Self {
                 span: offset..offset.saturating_add(indicator.len().max(1)).min(input_len),
-                kind: StructuralErrorKind::Syntax {
+                kind: Box::new(StructuralErrorKind::Syntax {
                     reason: SyntaxErrorKind::UnknownTypeIndicator,
-                },
+                }),
                 cause: Some(Box::new(DataTypeError::UnknownTypeSpecifier(
                     indicator.clone(),
                 ))),
@@ -211,9 +295,9 @@ impl StructuralError {
                     .unwrap_or(cause.as_bytes().len() - cause.utf8_error().valid_up_to());
             return Self {
                 span: start..end,
-                kind: StructuralErrorKind::Syntax {
+                kind: Box::new(StructuralErrorKind::Syntax {
                     reason: SyntaxErrorKind::InvalidNameEncoding,
-                },
+                }),
                 cause: Some(Box::new(cause.clone())),
             };
         }
@@ -232,20 +316,68 @@ impl StructuralError {
             .unwrap_or(SyntaxErrorKind::MalformedDescriptor);
         Self {
             span: point,
-            kind: StructuralErrorKind::Syntax { reason },
+            kind: Box::new(StructuralErrorKind::Syntax { reason }),
             cause: None,
         }
     }
 }
 
 impl fmt::Display for StructuralError {
+    /// Formats the error's byte range and description.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ADI error at bytes {}..{}: ",
-            self.span.start, self.span.end
-        )?;
-        match &self.kind {
+            "ADI error at bytes {}..{}: {}",
+            self.span.start, self.span.end, self.kind
+        )
+    }
+}
+
+impl fmt::Display for StructuralErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StructuralErrorKind::DuplicateUserDefinition {
+                field_name,
+                first_span,
+                ..
+            } => write!(
+                f,
+                "duplicate USERDEF target {field_name}; first declared at bytes {}..{}",
+                first_span.start, first_span.end
+            ),
+            StructuralErrorKind::UserDefinitionConstraintViolation {
+                field_name,
+                cause,
+                constraint_span,
+                ..
+            } => write!(
+                f,
+                "USERDEF constraint failed for {field_name}: {cause}; constraint at bytes {}..{}",
+                constraint_span.start, constraint_span.end
+            ),
+            StructuralErrorKind::TypeConflict {
+                field_name,
+                expected,
+                supplied,
+                ..
+            } => write!(
+                f,
+                "type conflict for {field_name}: expected {expected:?}, supplied {supplied:?}"
+            ),
+            StructuralErrorKind::NoMatchingType {
+                field_name,
+                failures,
+            } => {
+                write!(f, "no permitted type accepts {field_name}")?;
+                for failure in failures {
+                    write!(
+                        f,
+                        "; {:?}: {} at bytes {}..{}",
+                        failure.data_type, failure.cause, failure.span.start, failure.span.end
+                    )?;
+                }
+                Ok(())
+            }
             StructuralErrorKind::Syntax { reason } => write!(
                 f,
                 "{}",
@@ -278,7 +410,9 @@ impl fmt::Display for StructuralError {
                 "duplicate field {field_name}; first descriptor at bytes {}..{}",
                 first_span.start, first_span.end
             ),
-            StructuralErrorKind::InvalidValue { field_name, cause } => {
+            StructuralErrorKind::InvalidValue {
+                field_name, cause, ..
+            } => {
                 write!(f, "invalid value for {field_name}: {cause}")
             }
             StructuralErrorKind::InvalidUserDefinition { field_name, cause } => {
@@ -296,16 +430,21 @@ impl fmt::Display for StructuralError {
 
 impl StdError for StructuralError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        if let StructuralErrorKind::Decoding { cause } = &self.kind {
+        if let StructuralErrorKind::Decoding { cause } = self.kind.as_ref() {
             return Some(cause);
         }
         if let Some(cause) = self.cause.as_deref() {
             return Some(cause);
         }
-        if let StructuralErrorKind::InvalidValue { cause, .. } = &self.kind {
+        if let StructuralErrorKind::UserDefinitionConstraintViolation { cause, .. } =
+            self.kind.as_ref()
+        {
             return Some(cause);
         }
-        if let StructuralErrorKind::InvalidUserDefinition { cause, .. } = &self.kind {
+        if let StructuralErrorKind::InvalidValue { cause, .. } = self.kind.as_ref() {
+            return Some(cause);
+        }
+        if let StructuralErrorKind::InvalidUserDefinition { cause, .. } = self.kind.as_ref() {
             return Some(cause);
         }
         None
@@ -314,6 +453,12 @@ impl StdError for StructuralError {
 
 #[derive(Debug, Error, Clone)]
 pub(super) enum AdiError {
+    #[error("{kind}")]
+    Defined {
+        kind: Box<StructuralErrorKind>,
+        span: Range<usize>,
+        numeric_cause: Option<crate::adif::number::NumericCause>,
+    },
     #[error("duplicate field {field_name}")]
     DuplicateField {
         field_name: String,
@@ -334,14 +479,15 @@ pub(super) enum AdiError {
         field_name: String,
         span: Range<usize>,
         cause: ValueError,
-        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+        numeric_cause: Option<crate::adif::number::NumericCause>,
+        enumeration: Option<&'static str>,
     },
     #[error("invalid declaration {field_name}: {cause}")]
     InvalidUserDefinition {
         field_name: String,
         span: Range<usize>,
         cause: UserDefinitionError,
-        numeric_cause: Option<bigdecimal::ParseBigDecimalError>,
+        numeric_cause: Option<crate::adif::number::NumericCause>,
     },
     #[error("type {data_type:?} is unavailable in ADI")]
     TypeUnavailableInAdi {

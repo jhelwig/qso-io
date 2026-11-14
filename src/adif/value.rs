@@ -1,19 +1,23 @@
 use std::borrow::Cow;
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, num_bigint::BigInt};
 use chrono::{NaiveDate, NaiveTime};
 use thiserror::Error;
 
-/// A stored ADI value parsed using its explicit indicator, or untyped text.
+/// An ADIF field value.
 ///
-/// Empty contents are represented by Field::value returning None. This enum is
-/// exhaustive; its text representation is shared by the declared text types.
+/// This enum is exhaustive. Its text representation is shared by untyped
+/// contents and the declared text types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value<'a> {
     /// Original decoded text, retaining its spelling.
     Text(Cow<'a, str>),
-    /// ADIF Y/y or N/n parsed as a Boolean.
+    /// Top-level list members in source order, retaining compound member spelling.
+    List(Vec<Cow<'a, str>>),
+    /// The Boolean value represented by ADIF Y/y or N/n.
     Boolean(bool),
+    /// An exact Integer or PositiveInteger value.
+    Integer(BigInt),
     /// An exact ADIF decimal Number.
     Number(BigDecimal),
     /// A valid ADIF calendar date expressing a UTC date component.
@@ -90,9 +94,56 @@ pub enum Hemisphere {
     West,
 }
 
-/// The declared ADIF type whose value grammar failed.
+/// The reason an ADIF value violates its type grammar or applicable member set.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ValueError {
+    /// Invalid AwardList grammar, cardinality, or applicable membership.
+    #[error("invalid AwardList")]
+    InvalidAwardList,
+    /// Invalid CreditList grammar, cardinality, or applicable membership.
+    #[error("invalid CreditList")]
+    InvalidCreditList,
+    /// Invalid SponsoredAwardList grammar, cardinality, or applicable membership.
+    #[error("invalid SponsoredAwardList")]
+    InvalidSponsoredAwardList,
+    /// Invalid GridSquareList grammar, cardinality, or applicable membership.
+    #[error("invalid GridSquareList")]
+    InvalidGridSquareList,
+    /// Invalid POTARefList grammar, cardinality, or applicable membership.
+    #[error("invalid POTARefList")]
+    InvalidPOTARefList,
+    /// Invalid SecondarySubdivisionList grammar, cardinality, or applicable membership.
+    #[error("invalid SecondarySubdivisionList")]
+    InvalidSecondarySubdivisionList,
+    /// Invalid SecondaryAdministrativeSubdivisionListAlt grammar, cardinality, or applicable membership.
+    #[error("invalid SecondaryAdministrativeSubdivisionListAlt")]
+    InvalidSecondaryAdministrativeSubdivisionListAlt,
+
+    /// Invalid signed ASCII integer grammar.
+    #[error("invalid Integer")]
+    InvalidInteger,
+    /// Invalid unsigned integer grammar or a value not greater than zero.
+    #[error("invalid PositiveInteger")]
+    InvalidPositiveInteger,
+    /// Invalid Maidenhead locator.
+    #[error("invalid GridSquare")]
+    InvalidGridSquare,
+    /// Invalid additional Maidenhead locator pairs.
+    #[error("invalid GridSquareExt")]
+    InvalidGridSquareExt,
+    /// Invalid continent or island-group reference.
+    #[error("invalid IOTARefNo")]
+    InvalidIOTARefNo,
+    /// Invalid POTA reference format.
+    #[error("invalid POTARef")]
+    InvalidPOTARef,
+    /// Invalid SOTA text repertoire or missing slash/component.
+    #[error("invalid SOTARef")]
+    InvalidSOTARef,
+    /// Invalid WWFF reference format.
+    #[error("invalid WWFFRef")]
+    InvalidWWFFRef,
+
     /// Invalid Boolean spelling.
     #[error("invalid Boolean")]
     InvalidBoolean,
@@ -114,7 +165,7 @@ pub enum ValueError {
     /// A MultilineString character or line break fails the selected rules.
     #[error("invalid MultilineString")]
     InvalidMultilineString,
-    /// An Enumeration value fails the selected String character rules.
+    /// An Enumeration fails its text repertoire or applicable member set.
     #[error("invalid Enumeration")]
     InvalidEnumeration,
 }

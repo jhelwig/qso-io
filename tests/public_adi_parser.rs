@@ -61,6 +61,173 @@ fn definition<'r, 'a>(
 }
 
 #[test]
+fn subdivision_membership_preserves_groups_without_requiring_or_inferring_dxcc() {
+    use qso_io::adif::primary_subdivisions::{canada, united_states, venezuela};
+
+    assert_eq!(
+        "CA".parse::<united_states::PrimarySubdivision>()
+            .expect("CA should identify California within the US group"),
+        united_states::PrimarySubdivision::California
+    );
+    assert_eq!(
+        "ca".parse::<venezuela::PrimarySubdivision>()
+            .expect("CA should identify Carabobo within the Venezuela group"),
+        venezuela::PrimarySubdivision::Carabobo
+    );
+    assert!(
+        "CA".parse::<canada::PrimarySubdivision>().is_err(),
+        "a shared code must not become a member of every country's enum"
+    );
+
+    for bytes in [
+        &b"<STATE:2>ca<EOR>"[..],
+        &b"<MY_STATE:2>ca<EOR>"[..],
+        &b"<DXCC:1>1<STATE:2>ca<EOR>"[..],
+        &b"<MY_DXCC:1>1<MY_STATE:2>ca<EOR>"[..],
+    ] {
+        let mut parser = Parser::new(bytes, ParseOpts::default());
+        let parsed = record(next_section(&mut parser));
+        let subdivision = parsed
+            .field("STATE")
+            .or_else(|| parsed.field("MY_STATE"))
+            .unwrap_or_else(|| panic!("expected a subdivision field in {parsed:?}"));
+        assert_eq!(subdivision.text(), "ca", "input: {bytes:?}");
+        assert!(
+            matches!(subdivision.value(), Some(qso_io::adif::Value::Text(text)) if text == "ca"),
+            "membership must retain text without selecting a country's variant: {subdivision:?}"
+        );
+        assert_eq!(
+            parsed.field("DXCC").is_some() || parsed.field("MY_DXCC").is_some(),
+            bytes.starts_with(b"<DXCC") || bytes.starts_with(b"<MY_DXCC"),
+            "parsing must not infer a DXCC field: {parsed:?}"
+        );
+        assert_exhausted(&mut parser);
+    }
+
+    let mut parser = Parser::new(b"<STATE:3>???<EOR>", ParseOpts::default());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(
+            error.kind(),
+            StructuralErrorKind::InvalidValue {
+                enumeration: Some("Primary_Administrative_Subdivision"),
+                ..
+            }
+        ),
+        "unknown codes must fail membership: {error:?}"
+    );
+    assert_eq!(error.span(), 9..12, "{error:?}");
+    assert_exhausted(&mut parser);
+}
+
+#[test]
+fn reference_types_and_parser_share_standard_membership() {
+    use qso_io::adif::{AntPath, ArrlSection, Continent, QslMedium};
+
+    assert_eq!(
+        "g".parse::<AntPath>().expect("G should name grayline"),
+        AntPath::G
+    );
+    assert_eq!(
+        "eu".parse::<Continent>().expect("EU should name Europe"),
+        Continent::Europe
+    );
+    assert_eq!(
+        "lotw"
+            .parse::<QslMedium>()
+            .expect("LOTW should name Logbook of the World"),
+        QslMedium::Lotw
+    );
+    let historical = "gta"
+        .parse::<ArrlSection>()
+        .expect("GTA should retain its historical identity");
+    assert_eq!(historical.name(), "Greater Toronto Area");
+    assert_eq!(
+        historical
+            .deleted_date()
+            .map(|date| date.to_string())
+            .as_deref(),
+        Some("2023-01-01")
+    );
+
+    let bytes = b"<ANT_PATH:1>g<ARRL_SECT:3>gta<CONT:2>eu<CREDIT_GRANTED:8>WAS:lotw<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    let section = record(next_section(&mut parser));
+    assert_eq!(
+        named(&section, "ANT_PATH")
+            .text()
+            .parse::<AntPath>()
+            .expect("accepted ANT_PATH should have a reference value"),
+        AntPath::G
+    );
+    assert_eq!(
+        named(&section, "ARRL_SECT")
+            .text()
+            .parse::<ArrlSection>()
+            .expect("accepted section should have a reference value"),
+        historical
+    );
+    assert_exhausted(&mut parser);
+
+    assert!(
+        " EU".parse::<Continent>().is_err(),
+        "reference parsing must not trim values"
+    );
+    let mut parser = Parser::new(b"<CONT:3> EU<EOR>", ParseOpts::default());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(
+            error.kind(),
+            StructuralErrorKind::InvalidValue {
+                enumeration: Some("Continent"),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn alternative_enumeration_labels_outlive_the_error() {
+    let mut parser = Parser::new(b"<CREDIT_GRANTED:8>AJA,NOPE<EOR>", ParseOpts::default());
+    let labels: Vec<Option<&'static str>> = {
+        let error = next_error(&mut parser);
+        let StructuralErrorKind::NoMatchingType { failures, .. } = error.kind() else {
+            panic!("expected alternative failures, got {error:?}");
+        };
+        failures
+            .iter()
+            .map(|failure| failure.enumeration())
+            .collect()
+    };
+
+    assert_eq!(labels, [Some("Credit"), Some("Award")]);
+    assert_exhausted(&mut parser);
+}
+
+#[test]
+fn identifier_membership_errors_retain_the_expected_enumeration() {
+    let bytes = b"<IOTA:6>ZZ-001<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(
+            error.kind(),
+            StructuralErrorKind::InvalidValue {
+                field_name,
+                cause: qso_io::adif::ValueError::InvalidIOTARefNo,
+                enumeration: Some("Continent"),
+            } if field_name == "IOTA"
+        ),
+        "IOTA continent membership should identify its expected enumeration: {error:?}"
+    );
+    assert_eq!(error.span(), 8..10, "{error:?}");
+    assert_eq!(&bytes[error.span()], b"ZZ");
+    assert_exhausted(&mut parser);
+}
+
+#[test]
 fn options_and_read_only_values_are_usable_by_a_consumer() {
     for (encoding, field_length, bytes, value) in [
         (
@@ -493,6 +660,8 @@ fn composite_values_and_definitions_outlive_the_parser() {
                 assert!(*b);
                 "boolean"
             }
+            Value::Integer(_) => "integer",
+            Value::List(_) => "list",
             Value::Number(n) => {
                 assert_eq!(n, &bigdecimal::BigDecimal::from(1));
                 "number"
@@ -534,10 +703,12 @@ fn composite_values_and_definitions_outlive_the_parser() {
     assert_eq!(t.precision(), TimePrecision::Second);
     assert_eq!(t.time().to_string(), "13:05:00");
     assert!(
-        matches!(named(second, "EPC").value(),Some(Value::Text(s)) if s=="123"),
+        matches!(named(second, "EPC").value(),Some(Value::Number(n)) if n == &bigdecimal::BigDecimal::from(123)),
         "unexpected value: {:?}",
         named(second, "EPC").value()
     );
+    assert_eq!(named(second, "EPC").text(), "123");
+    assert_eq!(named(second, "EPC").type_indicator(), None);
 }
 
 #[test]
@@ -564,5 +735,187 @@ fn latin1_declaration_error_uses_original_bytes_after_an_accent() {
         "unexpected value: {:?}",
         error.kind()
     );
+    assert_exhausted(&mut parser);
+}
+
+#[test]
+fn inline_indicator_is_distinct_from_value_presence() {
+    use qso_io::adif::{DataType, Value};
+
+    let mut parser = Parser::new(b"<X:0:N><EOR><X:3>123<EOR>", ParseOpts::default());
+    let empty = record(next_section(&mut parser));
+    let field = named(&empty, "X");
+    assert_eq!(field.data_type(), Some(DataType::Number));
+    assert_eq!(field.type_indicator(), Some(DataType::Number));
+    assert!(field.value().is_none(), "empty field: {field:?}");
+    assert_eq!(field.text(), "");
+    assert_eq!(field.raw_data(), b"");
+
+    let untyped = record(next_section(&mut parser));
+    let field = named(&untyped, "X");
+    assert_eq!(field.data_type(), None);
+    assert_eq!(field.type_indicator(), None);
+    assert!(
+        matches!(field.value(), Some(Value::Text(text)) if text == "123"),
+        "field: {field:?}"
+    );
+}
+
+#[test]
+fn document_rules_and_alternative_errors_are_available_to_consumers() {
+    use qso_io::adif::{DataType, Value};
+
+    let bytes = b"P<USERDEF1:5:N>SCORE<EOH><SCORE:3>123<APP_EXAMPLE_SCORE:1:N>1<EOR><APP_EXAMPLE_SCORE:1>2<EOR><CREDIT_GRANTED:8>AJA,NOPE<EOR>";
+    let mut parser = Parser::new(bytes, ParseOpts::default());
+    drop(next_section(&mut parser));
+    let first = record(next_section(&mut parser));
+    assert_eq!(named(&first, "SCORE").data_type(), Some(DataType::Number));
+    assert_eq!(named(&first, "SCORE").type_indicator(), None);
+    let second = record(next_section(&mut parser));
+    assert!(
+        matches!(named(&second, "APP_EXAMPLE_SCORE").value(), Some(Value::Number(n)) if n == &bigdecimal::BigDecimal::from(2)),
+        "{second:?}"
+    );
+    assert_eq!(named(&second, "APP_EXAMPLE_SCORE").type_indicator(), None);
+    let error = next_error(&mut parser);
+    let StructuralErrorKind::NoMatchingType { failures, .. } = error.kind() else {
+        panic!("expected both alternatives, got {error:?}");
+    };
+    assert_eq!(failures[0].enumeration(), Some("Credit"));
+    assert_eq!(failures[1].enumeration(), Some("Award"));
+    assert_eq!(&bytes[error.span()], b"AJA");
+    assert_eq!(&bytes[failures[1].span()], b"NOPE");
+    assert_exhausted(&mut parser);
+    assert_eq!(named(&first, "SCORE").text(), "123");
+}
+
+#[test]
+fn secondary_candidates_dispatch_prefixes_and_preserve_overlaps() {
+    use qso_io::adif::{
+        AlaskaCounty, SecondarySubdivision as S, primary_subdivisions::united_states,
+    };
+
+    let alaska: Vec<_> = S::candidates("aK,Aleutians East").collect();
+    assert_eq!(alaska, [S::Alaska(AlaskaCounty::AleutiansEast)]);
+    assert_eq!(AlaskaCounty::AleutiansEast.as_str(), "Aleutians East");
+    for code in ["AK,Imaginary", "AK,", "HI,", "ZZ,County", " AK,Anchorage"] {
+        let candidates: Vec<_> = S::candidates(code).collect();
+        assert!(
+            candidates.is_empty(),
+            "invalid {code:?} produced {candidates:?}"
+        );
+    }
+    assert_eq!(
+        S::candidates("hI,Hawaii").collect::<Vec<_>>(),
+        [S::Hawaii("Hawaii".into())]
+    );
+    assert_eq!(
+        S::candidates("ma,Franklin").collect::<Vec<_>>(),
+        [S::UnitedStates {
+            state: united_states::PrimarySubdivision::Massachusetts,
+            county: "Franklin".into(),
+        }]
+    );
+
+    let numeric: Vec<_> = S::candidates("01001").collect();
+    assert!(
+        numeric
+            .iter()
+            .any(|v| matches!(v, S::Japan(code) if code == "01001")),
+        "Japanese candidate missing: {numeric:?}"
+    );
+    assert!(
+        numeric
+            .iter()
+            .any(|v| matches!(v, S::Spain(code) if code == "01001")),
+        "Spanish candidate missing: {numeric:?}"
+    );
+    assert!(
+        !numeric.iter().any(|v| matches!(v, S::NewZealand(_))),
+        "five digits must not match NZ's three-digit format: {numeric:?}"
+    );
+    let district: Vec<_> = S::candidates("AB-01").collect();
+    assert!(
+        district
+            .iter()
+            .any(|v| matches!(v, S::AsiaticRussia(code) if code == "AB-01")),
+        "Russian candidate missing: {district:?}"
+    );
+    assert!(
+        district
+            .iter()
+            .any(|v| matches!(v, S::Ukraine(code) if code == "AB-01")),
+        "Ukrainian candidate missing: {district:?}"
+    );
+}
+
+#[test]
+fn alternate_subdivisions_dispatch_to_suffix_only_members() {
+    use qso_io::adif::{NzRegionDistrict, SecondarySubdivisionAlt as S};
+
+    assert_eq!(
+        S::parse_member("nz_regions:Hawkes Bay/Wairoa"),
+        Some(S::NzRegions(NzRegionDistrict::HawkesBayWairoa))
+    );
+    assert_eq!(
+        NzRegionDistrict::HawkesBayWairoa.as_str(),
+        "Hawkes Bay/Wairoa"
+    );
+    for member in [
+        "NZ_Regions:Imaginary",
+        "NZ_Regions:",
+        ":Unlisted",
+        "OTHER:",
+        "OTHER",
+    ] {
+        assert_eq!(
+            S::parse_member(member),
+            None,
+            "invalid alternate member {member:?}"
+        );
+    }
+    assert_eq!(
+        S::parse_member("Other:Unlisted"),
+        Some(S::Other {
+            enumeration: "Other".into(),
+            code: "Unlisted".into(),
+        })
+    );
+}
+
+#[test]
+fn sponsor_components_compose_with_award_lists_and_preserve_diagnostics() {
+    use qso_io::adif::{AwardSponsor, Value, ValueError};
+
+    let value = format!(
+        "{}_PROGRAM_AWARD,cq_OTHER_UNKNOWN",
+        AwardSponsor::Arrl.as_str()
+    );
+    let bytes = format!("<AWARD_GRANTED:{}>{value}<EOR>", value.len());
+    let mut parser = Parser::new(bytes.as_bytes(), ParseOpts::default());
+    let parsed = record(next_section(&mut parser));
+    let award = named(&parsed, "AWARD_GRANTED");
+    assert_eq!(award.text(), value);
+    assert!(
+        matches!(award.value(), Some(Value::List(members)) if members == &["ARRL_PROGRAM_AWARD", "cq_OTHER_UNKNOWN"]),
+        "{award:?}"
+    );
+    assert_exhausted(&mut parser);
+
+    let value = "arrl_PROGRAM_AWARD,NOPE_PROGRAM_AWARD";
+    let descriptor = format!("<AWARD_GRANTED:{}>", value.len());
+    let bytes = format!("{descriptor}{value}<EOR><CALL:1>X<EOR>");
+    let mut parser = Parser::new(bytes.as_bytes(), ParseOpts::default());
+    let error = next_error(&mut parser);
+    assert!(
+        matches!(error.kind(), StructuralErrorKind::InvalidValue {
+        field_name, cause: ValueError::InvalidSponsoredAwardList,
+        enumeration: Some("Award_Sponsor"), ..
+    } if field_name == "AWARD_GRANTED"),
+        "{error:?}"
+    );
+    let start = descriptor.len() + "arrl_PROGRAM_AWARD,".len();
+    assert_eq!(error.span(), start..start + "NOPE_".len(), "{error}");
+    assert_eq!(&bytes.as_bytes()[error.span()], b"NOPE_");
     assert_exhausted(&mut parser);
 }

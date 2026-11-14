@@ -40,7 +40,7 @@ the same boundaries under byte and Unicode-scalar length settings.
 | Matir `testdata/header_comment.adi` | Complete framing; ASCII | Preamble-only header followed by one record. |
 | Matir `testdata/header_version.adi` | **Malformed structural input** | `<mycall>` omits the required length. It also starts directly with `<adif_ver:4>`, then supplies EOH; that is not the standard header form with a non-`<` opening character. Do not treat the filename as proof of valid framing. |
 | Matir `testdata/readrecord.adi` | **Malformed: unterminated final record** | Two complete records precede `<mycall:4>W1AW` without EOR. Useful for testing a reliable prefix and an unfinished final record. |
-| difa `examples/sample.adif` | Complete framing; ASCII | Header and three records; four- and six-digit times, several bands/modes. No claim that every mode spelling is canonical for the current standard. |
+| difa `examples/sample.adif` | Complete framing; invalid standard MODE | Header and three framed records; the third supplies Q65 as MODE, but ADIF defines it as a submode. Typed parsing yields the first two records, then rejects Q65. Four- and six-digit time spellings remain in the original bytes. |
 | TypeScript `test/data/wsjtx.adi` | Complete framing; ASCII | WSJT-X export, exact decimal frequency text, six-digit times and signal reports. |
 | TypeScript `test/data/js8call.adi` | Complete framing; ASCII | JS8Call export with mode/submode and explicit zero-length GRIDSQUARE/RST_RCVD fields. |
 | TransADIF `test-cases/01-plain-examples/1-plain-ascii-in.adi` | Complete framing; ASCII | Header, CRLF line endings, decimal frequency and minute-precision time. |
@@ -65,6 +65,10 @@ In `2-overcount-in.adi`, the original NAME bytes contain `C3 A1`, `C3 B1` and
 scalar mode includes the next descriptor's opening delimiter. Whether following
 inter-field text can still be parsed depends on the actual grammar, so do not
 derive a mandatory structural rejection or recovery rule from the filename.
+With standard field typing enabled, byte-framed undercount input fails on the
+lone CR in NOTES; scalar-framed undercount/overcount input fails when NAME
+includes CRLF. These are located typed-value failures, not length truncation.
+Framing tests still inspect the original counted bytes independently.
 
 TransADIF repairs encodings and field counts. Its expected-output files were
 intentionally not imported: they would encode behavior that is not the explicit

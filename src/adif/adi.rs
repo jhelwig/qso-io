@@ -8,9 +8,14 @@ use std::{borrow::Cow, ops::Range};
 
 use crate::adif::Field;
 
-pub use header::{HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError};
+pub use header::{
+    HeaderEntry, UserDefinition, UserDefinitionConstraint, UserDefinitionError,
+    UserDefinitionValueError,
+};
 pub use parser::Parser;
-pub use parser::error::{StructuralError, StructuralErrorKind, SyntaxErrorKind};
+pub use parser::error::{
+    StructuralError, StructuralErrorKind, SyntaxErrorKind, TypeAlternativeFailure,
+};
 
 mod header;
 mod parser;
@@ -24,22 +29,12 @@ pub enum Section<'a> {
     Record(Record<'a>),
 }
 
-/// An ADI file containing an optional header and an ordered sequence of records.
-///
-/// Public parsing currently uses [`Parser`] and [`Section`]; this container
-/// does not yet expose a public constructor or accessors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdiFile<'a> {
-    header: Option<Header<'a>>,
-    records: Vec<Record<'a>>,
-}
-
 /// A complete ADI header with its original preamble and ordered fields.
 ///
 /// Its source span ends after EOH's closing `>` and excludes following
 /// separators. Its preamble and fields have successfully decoded text.
 /// Field names are unique within the header under ASCII case-insensitive
-/// comparison.
+/// comparison. USERDEF target names are also unique under that comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header<'a> {
     span: Range<usize>,
@@ -62,7 +57,9 @@ impl<'a> Header<'a> {
             .find(|e| e.name().eq_ignore_ascii_case(name))
     }
 
-    /// Finds an ordinary field; USERDEFn declarations are exposed through entries.
+    /// Finds a header field by name.
+    ///
+    /// USERDEF declarations are available through [`Self::entries`].
     pub fn field(&self, name: &str) -> Option<&Field<'a>> {
         match self.entry(name)? {
             HeaderEntry::Field(f) => Some(f),

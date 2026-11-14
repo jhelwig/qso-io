@@ -9,22 +9,23 @@ use winnow::{
     token::{take_till, take_until, take_while},
 };
 
-#[cfg(test)]
-use super::AdiFile;
 use crate::adif::{
     DataSpecifier, DataType, DecodeError, Field, LengthUnit, ParseEncoding, ParseOpts,
     adi::{Header, HeaderEntry, Record, Section, parser::error::AdiError},
 };
 
 mod declarations;
+mod definitions;
 pub(super) mod error;
 #[cfg(test)]
 mod tests;
 mod values;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct State {
     parser_options: ParseOpts,
+    user_definitions: HashMap<String, definitions::UserFieldRule>,
+    application_types: HashMap<String, definitions::EstablishedApplicationType>,
 }
 
 type Stream<'is> = Stateful<LocatingSlice<&'is [u8]>, State>;
@@ -40,7 +41,20 @@ enum Phase {
 ///
 /// Earlier sections remain usable if a later section fails. A structural error
 /// is yielded once, followed by permanent exhaustion. Decoding errors are
-/// terminal, including in field values and header preambles.
+/// terminal, including in field values and header preambles. Resolved standard,
+/// USERDEF and application-field types are validated before a section is yielded.
+/// Document rules belong to this parser independently of returned headers.
+///
+/// Historical enumeration members are accepted independently of QSO-date
+/// applicability. Primary subdivision membership spans the supplied country
+/// groups independently of record DXCC, without identifying or inferring a
+/// country. Recommended enumerations for String fields such as CONTEST_ID remain
+/// advisory during parsing.
+///
+/// Decoding rejects invalid input without replacement. ASCII failures identify
+/// the first non-ASCII byte; UTF-8 failures identify the invalid or incomplete
+/// sequence. Byte-length values are framed before decoding, while UTF-8 scalar
+/// lengths require valid scalar traversal to locate the value boundary.
 ///
 /// A nonempty input whose first byte is not `<` starts with a header preamble
 /// and requires an EOH terminator. Input starting with `<` is parsed as records
@@ -87,6 +101,7 @@ impl<'a> Parser<'a> {
                 input: LocatingSlice::new(input),
                 state: State {
                     parser_options: options,
+                    ..State::default()
                 },
             },
             input_len: input.len(),
@@ -228,6 +243,7 @@ fn eoh<'a>(input: &mut Stream<'a>) -> Result<Range<usize>> {
         .parse_next(input)
 }
 
+#[derive(Clone)]
 struct FramedField<'a> {
     specifier: DataSpecifier<'a>,
     raw_data: &'a [u8],
@@ -236,19 +252,44 @@ struct FramedField<'a> {
     text: Cow<'a, str>,
 }
 
-fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
-    let f = framed_field(input)?;
+fn prepared_field<'a>(
+    input: &mut Stream<'a>,
+) -> Result<(Field<'a>, definitions::ResolvedDefinition)> {
+    let (specifier, span) = data_specifier.with_span().parse_next(input)?;
+    let resolution = definitions::resolve(
+        &input.state,
+        crate::adif::catalog::FieldSection::Record,
+        &specifier,
+        span.clone(),
+    )
+    .map_err(|error| ContextError::from_external_error(input, error))?;
+    let f = frame_value(input, specifier, span)?;
+    let parsed = definitions::parse_resolved(input, f, &resolution)?;
+    definitions::check_user_constraints(&input.state, &parsed)
+        .map_err(|error| ContextError::from_external_error(input, error))?;
+    Ok((parsed, resolution))
+}
 
-    values::parse(input, f)
+#[cfg(test)]
+fn field<'a>(input: &mut Stream<'a>) -> Result<Field<'a>> {
+    prepared_field(input).map(|(field, _)| field)
 }
 
 fn header_entry<'a>(input: &mut Stream<'a>) -> Result<HeaderEntry<'a>> {
-    let f = framed_field(input)?;
-
-    if declarations::is_declaration(&f.specifier.name) {
+    let (specifier, span) = data_specifier.with_span().parse_next(input)?;
+    if declarations::is_declaration(&specifier.name) {
+        let f = frame_value(input, specifier, span)?;
         declarations::parse(input, f).map(HeaderEntry::UserDefinition)
     } else {
-        values::parse(input, f).map(HeaderEntry::Field)
+        let resolution = definitions::resolve(
+            &input.state,
+            crate::adif::catalog::FieldSection::Header,
+            &specifier,
+            span.clone(),
+        )
+        .map_err(|error| ContextError::from_external_error(input, error))?;
+        let f = frame_value(input, specifier, span)?;
+        definitions::parse_resolved(input, f, &resolution).map(HeaderEntry::Field)
     }
 }
 
@@ -271,11 +312,24 @@ fn unique_header_entry<'a>(
     }
 
     seen.insert(key, entry.descriptor_span());
+    if let HeaderEntry::UserDefinition(definition) = &entry {
+        definitions::register_user_definition(&mut input.state, definition)
+            .map_err(|error| ContextError::from_external_error(input, error))?;
+    }
     Ok(entry)
 }
 
+#[cfg(test)]
 fn framed_field<'a>(input: &mut Stream<'a>) -> Result<FramedField<'a>> {
     let (specifier, descriptor_span) = data_specifier.with_span().parse_next(input)?;
+    frame_value(input, specifier, descriptor_span)
+}
+
+fn frame_value<'a>(
+    input: &mut Stream<'a>,
+    specifier: DataSpecifier<'a>,
+    descriptor_span: Range<usize>,
+) -> Result<FramedField<'a>> {
     if specifier.length == 0 {
         return Ok(FramedField {
             specifier,
@@ -424,7 +478,7 @@ fn data_specifier<'a>(input: &mut Stream<'a>) -> Result<DataSpecifier<'a>> {
         Ok::<_, std::string::FromUtf8Error>(DataSpecifier {
             name,
             length,
-            data_type,
+            type_indicator: data_type,
         })
     })
     .context(StrContext::Label("data specifier"))
@@ -465,7 +519,7 @@ fn unique_field<'a>(
     seen: &mut HashMap<String, Range<usize>>,
 ) -> Result<Field<'a>> {
     let checkpoint = input.checkpoint();
-    let parsed = field.parse_next(input)?;
+    let (parsed, resolution) = prepared_field(input)?;
     let key = parsed.name().to_ascii_uppercase();
 
     if let Some(first_span) = seen.get(&key) {
@@ -479,6 +533,7 @@ fn unique_field<'a>(
     }
 
     seen.insert(key, parsed.descriptor_span());
+    definitions::register_application(&mut input.state, &parsed, &resolution);
     Ok(parsed)
 }
 
@@ -510,21 +565,6 @@ fn record<'a>(input: &mut Stream<'a>) -> Result<Record<'a>> {
 }
 
 #[cfg(test)]
-fn adi_file<'a>(input: &mut Stream<'a>) -> Result<AdiFile<'a>> {
-    let header = match input.peek_token() {
-        None | Some(b'<') => None,
-        Some(_) => Some(header.parse_next(input)?),
-    };
-
-    let records = repeat_till(0.., record, eof)
-        .map(|(r, _)| r)
-        .context(StrContext::Label("adi file"))
-        .parse_next(input)?;
-
-    Ok(AdiFile { header, records })
-}
-
-#[cfg(test)]
 mod test {
     use super::*;
 
@@ -534,6 +574,7 @@ mod test {
             input: LocatingSlice::new("<NAME:3>Ray".as_bytes()),
             state: State {
                 parser_options: ParseOpts::default(),
+                ..State::default()
             },
         };
         let parsed = field(&mut basic)
@@ -544,7 +585,8 @@ mod test {
         assert_eq!(parsed.text(), "Ray");
         assert_eq!(parsed.descriptor_span(), 0..8);
         assert_eq!(parsed.value_span(), 8..11);
-        assert_eq!(parsed.data_type(), None);
+        assert_eq!(parsed.data_type(), Some(DataType::String));
+        assert_eq!(parsed.type_indicator(), None);
     }
 
     #[test]
@@ -563,6 +605,7 @@ mod test {
             ),
             state: State {
                 parser_options: ParseOpts::default(),
+                ..State::default()
             },
         };
         let parsed = header(&mut header_text)
